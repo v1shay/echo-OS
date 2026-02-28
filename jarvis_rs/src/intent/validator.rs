@@ -28,6 +28,7 @@ pub struct SearchWebParams {
     pub query: String,
 }
 
+#[derive(Debug)]
 pub enum ValidatedParams {
     OpenApplication(OpenApplicationParams),
     ListFiles(ListFilesParams),
