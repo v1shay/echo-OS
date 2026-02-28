@@ -1,10 +1,28 @@
+mod intent;
+
+use intent::*;
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    jarvis_rs::logging::init();
+    let fake_llm_output = r#"
+    {
+        "intent": "open_application",
+        "parameters": {
+            "app_name": "Safari"
+        },
+        "risk_level": "low",
+        "requires_confirmation": false
+    }
+    "#;
 
-    // TODO: wire intent parsing -> safety validation -> LLM -> executor.
+    let parsed: IntentObject = serde_json::from_str(fake_llm_output)?;
+
+    println!("Parsed Intent: {:?}", parsed);
+
+    let validated = validate_parameters(&parsed)?;
+
+    println!("Validated Params: {:?}", validated);
 
     Ok(())
 }
