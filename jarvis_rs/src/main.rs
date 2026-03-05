@@ -1,4 +1,5 @@
 mod intent;
+mod executor;
 
 use intent::*;
 use anyhow::Result;
@@ -22,7 +23,9 @@ async fn main() -> Result<()> {
 
     let validated = validate_parameters(&parsed)?;
 
-    println!("Validated Params: {:?}", validated);
+    println!("Executing...\n");
+    executor::system::execute(validated)?;
+    println!("Done.");  
 
     Ok(())
 }
