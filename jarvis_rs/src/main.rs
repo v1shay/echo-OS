@@ -46,4 +46,26 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+
+    mod stt;
+mod audio;
+
+use stt::WhisperSTT;
+use audio::recorder::record_wav;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    println!("Recording...");
+
+    record_wav("input.wav", 5)?;
+
+    println!("Transcribing...");
+
+    let stt = WhisperSTT::new("ggml-base.bin");
+
+    let transcript = stt.transcribe("input.wav")?;
+
+    println!("Transcript: {}", transcript);
+
+    Ok(())
 }
