@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::io::ErrorKind;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -177,13 +178,25 @@ fn transcribe_with_whisper_cli(model_path: Option<&Path>, wav_path: &Path) -> Re
     command
         .arg("-f")
         .arg(wav_path)
+        .arg("-ng")
         .arg("-nt")
         .arg("-of")
         .arg(output_prefix.as_os_str());
 
-    let status = command.status().context("failed to start whisper-cli")?;
+    let status = match command.status() {
+        Ok(status) => status,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            bail!(
+                "whisper-cli is not installed. Install `whisper-cpp` and set JARVIS_WHISPER_MODEL_PATH to a local GGML model file."
+            );
+        }
+        Err(error) => return Err(error).context("failed to start whisper-cli"),
+    };
     if !status.success() {
-        bail!("whisper-cli exited with status {}", status);
+        bail!(
+            "whisper-cli exited with status {}. Verify JARVIS_WHISPER_MODEL_PATH points to a valid local model.",
+            status
+        );
     }
 
     let transcript = fs::read_to_string(&transcript_path)

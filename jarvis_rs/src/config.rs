@@ -101,6 +101,8 @@ impl AppConfig {
         }
         if let Ok(value) = env::var("JARVIS_WHISPER_MODEL_PATH") {
             config.whisper_model_path = Some(PathBuf::from(value));
+        } else if let Some(path) = auto_detect_whisper_model() {
+            config.whisper_model_path = Some(path);
         }
         if let Ok(value) = env::var("JARVIS_RECORDING_PATH") {
             config.recording_path = PathBuf::from(value);
@@ -149,4 +151,17 @@ impl AppConfig {
             self.provider.ollama_model, fallback, sms, stt, self.sms.webhook_bind
         )
     }
+}
+
+fn auto_detect_whisper_model() -> Option<PathBuf> {
+    let candidates = [
+        "/Users/agarwal/coding/jarvis/jarvis/.tooling/models/ggml-tiny.en.bin",
+        "/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin",
+        "/usr/local/share/whisper-cpp/for-tests-ggml-tiny.bin",
+    ];
+
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
 }
