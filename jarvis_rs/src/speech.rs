@@ -171,6 +171,7 @@ fn write_samples_u16(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWrit
 fn transcribe_with_whisper_cli(model_path: Option<&Path>, wav_path: &Path) -> Result<String> {
     let output_prefix = wav_path.with_extension("");
     let transcript_path = output_prefix.with_extension("txt");
+    let _ = fs::remove_file(&transcript_path);
     let mut command = Command::new("whisper-cli");
     if let Some(model_path) = model_path {
         command.arg("-m").arg(model_path);
@@ -180,6 +181,7 @@ fn transcribe_with_whisper_cli(model_path: Option<&Path>, wav_path: &Path) -> Re
         .arg(wav_path)
         .arg("-ng")
         .arg("-nt")
+        .arg("-otxt")
         .arg("-of")
         .arg(output_prefix.as_os_str());
 
@@ -202,4 +204,36 @@ fn transcribe_with_whisper_cli(model_path: Option<&Path>, wav_path: &Path) -> Re
     let transcript = fs::read_to_string(&transcript_path)
         .with_context(|| format!("failed to read {}", transcript_path.display()))?;
     Ok(transcript.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn whisper_cli_transcript_path_round_trip() {
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.tooling/models/ggml-tiny.en.bin");
+        let fixture_wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../input.wav");
+        let temp_wav = std::env::temp_dir().join(format!(
+            "jarvis-speech-test-{}.wav",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+
+        if !model_path.exists() || Command::new("whisper-cli").arg("-h").output().is_err() {
+            return;
+        }
+
+        fs::copy(&fixture_wav, &temp_wav).expect("fixture wav should copy");
+
+        let transcript = transcribe_with_whisper_cli(Some(model_path.as_path()), &temp_wav)
+            .expect("whisper-cli should write a transcript file");
+        let _ = fs::remove_file(temp_wav.with_extension("txt"));
+        let _ = fs::remove_file(&temp_wav);
+        assert!(transcript.is_empty());
+    }
 }

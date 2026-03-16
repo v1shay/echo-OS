@@ -154,14 +154,22 @@ impl AppConfig {
 }
 
 fn auto_detect_whisper_model() -> Option<PathBuf> {
-    let candidates = [
-        "/Users/agarwal/coding/jarvis/jarvis/.tooling/models/ggml-tiny.en.bin",
-        "/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin",
-        "/usr/local/share/whisper-cpp/for-tests-ggml-tiny.bin",
-    ];
+    let mut candidates = Vec::new();
 
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.exists())
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(root) = exe_path.parent().and_then(|debug| debug.parent()).and_then(|target| target.parent()) {
+            candidates.push(root.join(".tooling/models/ggml-tiny.en.bin"));
+            candidates.push(root.join(".tooling/models/ggml-base.en.bin"));
+        }
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join(".tooling/models/ggml-tiny.en.bin"));
+        candidates.push(current_dir.join(".tooling/models/ggml-base.en.bin"));
+    }
+
+    candidates.push(PathBuf::from("/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin"));
+    candidates.push(PathBuf::from("/usr/local/share/whisper-cpp/for-tests-ggml-tiny.bin"));
+
+    candidates.into_iter().find(|path| path.exists())
 }
