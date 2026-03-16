@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,16 +274,50 @@ impl MacAutomationBackend {
         } else {
             command.arg("-a").arg(&target.display_name);
         }
-        command
+        let status = command
             .status()
             .with_context(|| format!("failed to activate {}", target.display_name))?;
-        Ok(())
+        if !status.success() {
+            bail!("macOS failed to launch {}", target.display_name);
+        }
+
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(250));
+            if let Ok(frontmost) = self.frontmost_app_name() {
+                if frontmost == target.display_name {
+                    return Ok(());
+                }
+            }
+        }
+
+        let actual = self
+            .frontmost_app_name()
+            .unwrap_or_else(|_| "unknown".to_string());
+        bail!(
+            "tried to activate {}, but the frontmost app is {}",
+            target.display_name,
+            actual
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
     fn activate_app_target(&self, target: &AppTarget) -> Result<()> {
         let _ = target;
         bail!("app activation is only implemented on macOS");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn frontmost_app_name(&self) -> Result<String> {
+        self.run_applescript_lines(&vec![
+            r#"tell application "System Events""#.to_string(),
+            "return name of first application process whose frontmost is true".to_string(),
+            "end tell".to_string(),
+        ])
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn frontmost_app_name(&self) -> Result<String> {
+        bail!("frontmost app detection is only available on macOS");
     }
 
     #[cfg(target_os = "macos")]
@@ -475,11 +511,21 @@ impl AutomationBackend for MacAutomationBackend {
                     self.resolve_app_target(&app_name)?
                 };
                 self.activate_app_target(&target)?;
+                let frontmost = self
+                    .frontmost_app_name()
+                    .unwrap_or_else(|_| target.display_name.clone());
                 let mut result = Self::summary(
                     "app_activate",
                     format!("Activated {}", target.display_name),
                     None,
-                    serde_json::to_value(&target)?,
+                    json!({
+                        "requested_name": target.requested_name,
+                        "display_name": target.display_name,
+                        "bundle_id": target.bundle_id,
+                        "path": target.path,
+                        "frontmost_app": frontmost,
+                        "matched": frontmost == target.display_name,
+                    }),
                 );
                 result.target_identity = target
                     .bundle_id

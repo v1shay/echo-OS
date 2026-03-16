@@ -281,9 +281,17 @@ impl WorkerProvider for HeuristicWorkerProvider {
             "activate_app" => {
                 let app_name = extract_after_keyword(&state.user_request, "open")
                     .unwrap_or_else(|| "Google Chrome".to_string());
-                if state.last_tool_name.as_deref() == Some("app_activate") {
+                if frontmost_app_matches(state, &app_name) {
                     WorkerAction::Complete {
                         message: format!("Opened {}", app_name),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("app_activate") {
+                    WorkerAction::Tool {
+                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
+                    WorkerAction::Replan {
+                        reason: format!("{} did not become frontmost after activation", app_name),
                     }
                 } else {
                     WorkerAction::Tool {
@@ -292,9 +300,17 @@ impl WorkerProvider for HeuristicWorkerProvider {
                 }
             }
             "activate_chrome" => {
-                if state.last_tool_name.as_deref() == Some("app_activate") {
+                if frontmost_app_matches(state, "Google Chrome") {
                     WorkerAction::AdvanceStep {
                         note: "Chrome is active".to_string(),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("app_activate") {
+                    WorkerAction::Tool {
+                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
+                    WorkerAction::Replan {
+                        reason: "Chrome did not become frontmost after activation".to_string(),
                     }
                 } else {
                     WorkerAction::Tool {
@@ -368,9 +384,17 @@ impl WorkerProvider for HeuristicWorkerProvider {
                 }
             }
             "activate_mail" => {
-                if state.last_tool_name.as_deref() == Some("app_activate") {
+                if frontmost_app_matches(state, "Mail") {
                     WorkerAction::AdvanceStep {
                         note: "Mail is active".to_string(),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("app_activate") {
+                    WorkerAction::Tool {
+                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
+                    WorkerAction::Replan {
+                        reason: "Mail did not become frontmost after activation".to_string(),
                     }
                 } else {
                     WorkerAction::Tool {
@@ -403,9 +427,17 @@ impl WorkerProvider for HeuristicWorkerProvider {
                 }
             }
             "activate_messages" => {
-                if state.last_tool_name.as_deref() == Some("app_activate") {
+                if frontmost_app_matches(state, "Messages") {
                     WorkerAction::AdvanceStep {
                         note: "Messages is active".to_string(),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("app_activate") {
+                    WorkerAction::Tool {
+                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
+                    WorkerAction::Replan {
+                        reason: "Messages did not become frontmost after activation".to_string(),
                     }
                 } else {
                     WorkerAction::Tool {
@@ -481,6 +513,29 @@ impl WorkerProvider for HeuristicWorkerProvider {
     fn provider_name(&self) -> &'static str {
         "heuristic-worker"
     }
+}
+
+fn frontmost_app_matches(state: &TaskState, expected: &str) -> bool {
+    let expected = expected.to_ascii_lowercase();
+    let observation = match state.last_observation.as_ref() {
+        Some(observation) => observation,
+        None => return false,
+    };
+
+    if let Some(target_identity) = observation.target_identity.as_ref() {
+        if target_identity.to_ascii_lowercase().contains(&expected) {
+            return true;
+        }
+    }
+
+    let summary = observation.summary.to_ascii_lowercase();
+    let details = observation
+        .details
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    summary.contains(&expected) || details.contains(&expected)
 }
 
 pub struct PlannerStack {
