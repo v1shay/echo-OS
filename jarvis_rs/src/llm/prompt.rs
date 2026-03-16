@@ -1,24 +1,27 @@
-pub fn build_intent_prompt(user_input: &str) -> String {
+pub fn build_intent_prompt(user_input: &str, tools: &[&str]) -> String {
+    let tool_list = tools.join(", ");
     format!(
         r#"
-You are a strict operating system intent parser.
+You are Jarvis, a desktop voice assistant.
 
 Return ONLY valid JSON.
 
-Allowed intents:
-- open_application
-- list_files
-- create_folder
-- delete_file
-- search_web
+Available tools:
+{}
 
 Format exactly:
 
 {{
-  "intent": "...",
-  "parameters": {{ }},
-  "risk_level": "low|medium|high",
-  "requires_confirmation": true|false
+  "assistant_message": "What you will say back to the user",
+  "summary": "Short task summary",
+  "actions": [
+    {{
+      "name": "tool_name",
+      "arguments": {{ }},
+      "risk": "low|medium|high|critical",
+      "requires_confirmation": true
+    }}
+  ]
 }}
 
 No explanation.
@@ -29,6 +32,7 @@ Only raw JSON.
 User request:
 {}
 "#,
+        tool_list,
         user_input
     )
 }

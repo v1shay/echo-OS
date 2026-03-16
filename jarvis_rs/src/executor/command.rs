@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::process::Command;
 use crate::intent::validator::ValidatedParams;
 
