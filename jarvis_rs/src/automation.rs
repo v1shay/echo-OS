@@ -120,6 +120,19 @@ struct ScreenshotArgs {
     path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DraftEmailArgs {
+    to: Option<String>,
+    subject: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenMessagesArgs {
+    recipient: Option<String>,
+    body: Option<String>,
+}
+
 #[async_trait]
 impl AutomationBackend for LocalAutomationBackend {
     async fn call_tool(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
@@ -316,6 +329,85 @@ impl AutomationBackend for LocalAutomationBackend {
                 "SMS dispatch is handled by the background SMS service",
                 None,
             )),
+            "draft_email" => {
+                let args: DraftEmailArgs = serde_json::from_value(request.arguments)?;
+                #[cfg(target_os = "macos")]
+                {
+                    let recipient_line = args
+                        .to
+                        .as_deref()
+                        .map(|to| {
+                            format!(
+                                "make new to recipient at end of to recipients with properties {{address:\"{}\"}}",
+                                escape_applescript(to)
+                            )
+                        })
+                        .unwrap_or_default();
+                    let script = format!(
+                        r#"tell application "Mail"
+activate
+set newMessage to make new outgoing message with properties {{visible:true, subject:"{}", content:"{}"}}
+tell newMessage
+{}
+end tell
+end tell"#,
+                        escape_applescript(&args.subject),
+                        escape_applescript(&args.body),
+                        recipient_line
+                    );
+                    Command::new("osascript")
+                        .arg("-e")
+                        .arg(script)
+                        .status()
+                        .context("failed to create Mail draft")?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let mailto = format!(
+                        "mailto:{}?subject={}&body={}",
+                        args.to.unwrap_or_default(),
+                        args.subject.replace(' ', "%20"),
+                        args.body.replace(' ', "%20")
+                    );
+                    Command::new("xdg-open").arg(mailto).status()?;
+                }
+                Ok(Self::summary(
+                    "draft_email",
+                    "Opened a draft email",
+                    None,
+                ))
+            }
+            "open_messages" => {
+                let args: OpenMessagesArgs = serde_json::from_value(request.arguments)?;
+                #[cfg(target_os = "macos")]
+                {
+                    let body_suffix = args
+                        .body
+                        .as_deref()
+                        .map(|body| format!(" with draft text: {}", body))
+                        .unwrap_or_default();
+                    let status = Command::new("open").arg("-a").arg("Messages").status();
+                    status.context("failed to open Messages")?;
+                    Ok(Self::summary(
+                        "open_messages",
+                        format!(
+                            "Opened Messages{}{}",
+                            args.recipient
+                                .as_deref()
+                                .map(|recipient| format!(" for {}", recipient))
+                                .unwrap_or_default(),
+                            body_suffix
+                        ),
+                        None,
+                    ))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = args;
+                    Command::new("xdg-open").arg("sms:").status()?;
+                    Ok(Self::summary("open_messages", "Opened Messages", None))
+                }
+            }
             other => Err(anyhow!("unsupported tool: {}", other)),
         }
     }
@@ -358,7 +450,7 @@ impl AutomationBackend for LocalAutomationBackend {
                 }
             }
             "applescript_run" => RiskLevel::High,
-            "browser_extract" | "take_screenshot" => RiskLevel::Medium,
+            "browser_extract" | "take_screenshot" | "draft_email" | "open_messages" => RiskLevel::Medium,
             _ => request.risk,
         }
     }
@@ -378,8 +470,14 @@ impl AutomationBackend for LocalAutomationBackend {
             "applescript_run",
             "take_screenshot",
             "send_sms",
+            "draft_email",
+            "open_messages",
         ]
     }
+}
+
+fn escape_applescript(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]

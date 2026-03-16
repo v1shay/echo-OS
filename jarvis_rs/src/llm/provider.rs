@@ -107,24 +107,6 @@ impl PlanningProvider for HeuristicPlanningProvider {
     async fn plan_next_step(&self, user_input: &str, _tools: &[&str]) -> Result<AgentDecision> {
         let lowered = user_input.to_ascii_lowercase();
 
-        if lowered.contains("open ") {
-            let app_name = user_input
-                .split_once("open ")
-                .map(|(_, tail)| tail.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "Finder".to_string());
-            return Ok(AgentDecision {
-                assistant_message: format!("Opening {} and reporting back.", app_name),
-                summary: Some(format!("Open {}", app_name)),
-                actions: vec![ToolCallRequest {
-                    name: "open_app".to_string(),
-                    arguments: json!({ "app_name": app_name }),
-                    risk: RiskLevel::Low,
-                    requires_confirmation: false,
-                }],
-            });
-        }
-
         if lowered.contains("create folder") || lowered.contains("make folder") {
             let path = user_input
                 .split("called")
@@ -174,6 +156,81 @@ impl PlanningProvider for HeuristicPlanningProvider {
             });
         }
 
+        if lowered.contains("schoology") {
+            let url = user_input
+                .split_whitespace()
+                .find(|token| token.starts_with("http://") || token.starts_with("https://"))
+                .map(|token| token.to_string())
+                .unwrap_or_else(|| "https://app.schoology.com/home".to_string());
+            return Ok(AgentDecision {
+                assistant_message: "Opening Schoology.".to_string(),
+                summary: Some("Open Schoology".to_string()),
+                actions: vec![ToolCallRequest {
+                    name: "browser_open".to_string(),
+                    arguments: json!({ "url": url }),
+                    risk: RiskLevel::Low,
+                    requires_confirmation: false,
+                }],
+            });
+        }
+
+        if lowered.contains("open ") {
+            let app_name = user_input
+                .split_once("open ")
+                .map(|(_, tail)| tail.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "Finder".to_string());
+            return Ok(AgentDecision {
+                assistant_message: format!("Opening {} and reporting back.", app_name),
+                summary: Some(format!("Open {}", app_name)),
+                actions: vec![ToolCallRequest {
+                    name: "open_app".to_string(),
+                    arguments: json!({ "app_name": app_name }),
+                    risk: RiskLevel::Low,
+                    requires_confirmation: false,
+                }],
+            });
+        }
+
+        if lowered.contains("email") || lowered.starts_with("send mail") || lowered.starts_with("send an email") {
+            let recipient = extract_after_keyword(user_input, "to");
+            let subject = extract_after_keyword(user_input, "about")
+                .unwrap_or_else(|| "Jarvis follow-up".to_string());
+            let body = format!("Drafted by Jarvis for request: {}", user_input.trim());
+            return Ok(AgentDecision {
+                assistant_message: "Opening a draft email for you.".to_string(),
+                summary: Some("Draft email".to_string()),
+                actions: vec![ToolCallRequest {
+                    name: "draft_email".to_string(),
+                    arguments: json!({
+                        "to": recipient,
+                        "subject": subject,
+                        "body": body,
+                    }),
+                    risk: RiskLevel::Medium,
+                    requires_confirmation: false,
+                }],
+            });
+        }
+
+        if lowered.contains("message ") || lowered.starts_with("text ") {
+            let recipient = extract_after_keyword(user_input, "message")
+                .or_else(|| extract_after_keyword(user_input, "text"));
+            return Ok(AgentDecision {
+                assistant_message: "Opening Messages for you.".to_string(),
+                summary: Some("Open Messages".to_string()),
+                actions: vec![ToolCallRequest {
+                    name: "open_messages".to_string(),
+                    arguments: json!({
+                        "recipient": recipient,
+                        "body": format!("Drafted by Jarvis for request: {}", user_input.trim()),
+                    }),
+                    risk: RiskLevel::Medium,
+                    requires_confirmation: false,
+                }],
+            });
+        }
+
         if lowered.contains("browser") || lowered.contains("search") || lowered.contains("web") {
             let url = if lowered.contains("http://") || lowered.contains("https://") {
                 user_input.trim().to_string()
@@ -204,6 +261,24 @@ impl PlanningProvider for HeuristicPlanningProvider {
 
     fn provider_name(&self) -> &'static str {
         "heuristic"
+    }
+}
+
+fn extract_after_keyword(input: &str, keyword: &str) -> Option<String> {
+    let lowered = input.to_ascii_lowercase();
+    let needle = format!("{} ", keyword);
+    let start = lowered.find(&needle)?;
+    let slice = &input[start + needle.len()..];
+    let value = slice
+        .split(" about ")
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -283,5 +358,27 @@ mod tests {
 
         assert!(result.actions.is_empty());
         assert!(result.assistant_message.contains("I understood"));
+    }
+
+    #[tokio::test]
+    async fn heuristic_email_builds_draft_action() {
+        let provider = HeuristicPlanningProvider;
+        let result = provider
+            .plan_next_step("send an email to teacher@example.com about homework", &["draft_email"])
+            .await
+            .unwrap();
+
+        assert_eq!(result.actions[0].name, "draft_email");
+    }
+
+    #[tokio::test]
+    async fn heuristic_schoology_opens_browser() {
+        let provider = HeuristicPlanningProvider;
+        let result = provider
+            .plan_next_step("open schoology", &["browser_open"])
+            .await
+            .unwrap();
+
+        assert_eq!(result.actions[0].name, "browser_open");
     }
 }
