@@ -4,7 +4,10 @@ pub mod provider;
 pub mod schema;
 
 pub use provider::{
-    HeuristicPlanningProvider, OllamaPlanningProvider, OpenAiCompatibleProvider,
-    PlanningProvider, ProviderStack,
+    HeuristicPlannerProvider, HeuristicWorkerProvider, LocalLlamaPlannerProvider,
+    LocalLlamaWorkerProvider, PlannerProvider, PlannerStack, WorkerProvider, WorkerStack,
 };
-pub use schema::AgentDecision;
+pub use schema::{
+    CompletionStatus, Observation, PlanStep, StepStatus, TaskPlan, TaskState, WorkerAction,
+    WorkerDecision,
+};

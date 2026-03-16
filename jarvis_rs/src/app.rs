@@ -17,7 +17,11 @@ pub struct JarvisApp {
     transcript: String,
     assistant_message: String,
     status: String,
+    goal: String,
     current_task: String,
+    current_step: String,
+    last_observation: String,
+    last_tool: String,
     logs: Vec<String>,
     approval_required: Option<String>,
     speech_muted: bool,
@@ -40,7 +44,11 @@ impl JarvisApp {
             transcript: String::new(),
             assistant_message: "Jarvis is ready.".to_string(),
             status: "Idle".to_string(),
+            goal: "No active goal".to_string(),
             current_task: "No active task".to_string(),
+            current_step: "No active step".to_string(),
+            last_observation: "No observations yet".to_string(),
+            last_tool: "No tool selected".to_string(),
             logs: vec!["Workspace booted".to_string()],
             approval_required: None,
             speech_muted: false,
@@ -74,6 +82,22 @@ impl JarvisApp {
             AgentEvent::AssistantMessage(message) => {
                 self.assistant_message = message.clone();
                 self.logs.push(format!("Assistant: {}", message));
+            }
+            AgentEvent::GoalUpdated(goal) => {
+                self.goal = goal.clone();
+                self.logs.push(format!("Goal: {}", goal));
+            }
+            AgentEvent::StepUpdated(step) => {
+                self.current_step = step.clone();
+                self.logs.push(format!("Step: {}", step));
+            }
+            AgentEvent::ObservationUpdated(observation) => {
+                self.last_observation = observation.clone();
+                self.logs.push(format!("Observation: {}", observation));
+            }
+            AgentEvent::ToolPlanned(tool) => {
+                self.last_tool = tool.clone();
+                self.logs.push(tool);
             }
             AgentEvent::ToolLog(message) => self.logs.push(message),
             AgentEvent::TaskUpdated(summary) => {
@@ -126,28 +150,39 @@ impl eframe::App for JarvisApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-                ui.heading("Jarvis MVP");
+                ui.heading("Jarvis V2");
                 ui.label(self.config.config_summary());
                 ui.separator();
 
-                ui.label(RichText::new("Status").strong());
-                ui.label(&self.status);
-                ui.label(RichText::new("Current Task").strong());
-                ui.label(&self.current_task);
-                ui.separator();
+                ui.columns(2, |columns| {
+                    columns[0].label(RichText::new("Status").strong());
+                    columns[0].label(&self.status);
+                    columns[0].label(RichText::new("Goal").strong());
+                    columns[0].label(&self.goal);
+                    columns[0].label(RichText::new("Task").strong());
+                    columns[0].label(&self.current_task);
 
+                    columns[1].label(RichText::new("Current Step").strong());
+                    columns[1].label(&self.current_step);
+                    columns[1].label(RichText::new("Last Tool").strong());
+                    columns[1].label(&self.last_tool);
+                    columns[1].label(RichText::new("Last Observation").strong());
+                    columns[1].label(&self.last_observation);
+                });
+
+                ui.separator();
                 ui.columns(2, |columns| {
                     columns[0].label(RichText::new("Transcript").strong());
                     columns[0].add(
                         TextEdit::multiline(&mut self.transcript)
-                            .desired_rows(4)
+                            .desired_rows(5)
                             .interactive(false),
                     );
 
                     columns[1].label(RichText::new("Assistant").strong());
                     columns[1].add(
                         TextEdit::multiline(&mut self.assistant_message)
-                            .desired_rows(4)
+                            .desired_rows(5)
                             .interactive(false),
                     );
                 });
@@ -158,7 +193,7 @@ impl eframe::App for JarvisApp {
                     let response = ui.add(
                         TextEdit::singleline(&mut self.input)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Ask Jarvis to do something on your computer"),
+                            .hint_text("Tell Jarvis what to do"),
                     );
                     if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     {
@@ -209,7 +244,7 @@ impl eframe::App for JarvisApp {
                 ui.label(RichText::new("Activity Log").strong());
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
-                    .max_height(260.0)
+                    .max_height(280.0)
                     .show(ui, |ui| {
                         for line in &self.logs {
                             ui.label(line);
