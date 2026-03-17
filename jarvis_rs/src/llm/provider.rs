@@ -252,11 +252,6 @@ impl WorkerProvider for HeuristicWorkerProvider {
             });
         };
 
-        let last_summary = state
-            .last_observation
-            .as_ref()
-            .map(|observation| observation.summary.to_ascii_lowercase())
-            .unwrap_or_default();
         let last_details = state
             .last_observation
             .as_ref()
@@ -281,94 +276,106 @@ impl WorkerProvider for HeuristicWorkerProvider {
             "activate_app" => {
                 let app_name = extract_after_keyword(&state.user_request, "open")
                     .unwrap_or_else(|| "Google Chrome".to_string());
-                if frontmost_app_matches(state, &app_name) {
+                if observation_proved(state) || frontmost_app_matches(state, &app_name) {
                     WorkerAction::Complete {
                         message: format!("Opened {}", app_name),
                     }
                 } else if state.last_tool_name.as_deref() == Some("app_activate") {
-                    WorkerAction::Tool {
-                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
-                    }
-                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
                     WorkerAction::Replan {
                         reason: format!("{} did not become frontmost after activation", app_name),
                     }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("app_activate", json!({ "app_name": app_name }), RiskLevel::Low),
-                    }
+                    let mut request = tool("app_activate", json!({ "app_name": app_name }), RiskLevel::Low);
+                    request.expected_outcome = Some("requested app is frontmost".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "activate_chrome" => {
-                if frontmost_app_matches(state, "Google Chrome") {
+                if observation_proved(state) || frontmost_app_matches(state, "Google Chrome") {
                     WorkerAction::AdvanceStep {
                         note: "Chrome is active".to_string(),
                     }
                 } else if state.last_tool_name.as_deref() == Some("app_activate") {
-                    WorkerAction::Tool {
-                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
-                    }
-                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
                     WorkerAction::Replan {
                         reason: "Chrome did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("app_activate", json!({ "app_name": "Google Chrome" }), RiskLevel::Low),
-                    }
+                    let mut request = tool("app_activate", json!({ "app_name": "Google Chrome" }), RiskLevel::Low);
+                    request.expected_outcome = Some("Google Chrome is frontmost".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "open_schoology" => {
-                if state.last_tool_name.as_deref() == Some("chrome_open_tab") && last_summary.contains("opened") {
+                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
                     WorkerAction::AdvanceStep {
                         note: "Schoology is open".to_string(),
                     }
+                } else if matches!(state.last_tool_name.as_deref(), Some("browser_open") | Some("chrome_open_tab")) {
+                    let mut request = tool(
+                        "browser_assert",
+                        json!({ "url_contains": "schoology", "text_contains": "schoology" }),
+                        RiskLevel::Low,
+                    );
+                    request.expected_outcome = Some("Schoology is visible in Chrome".to_string());
+                    WorkerAction::Tool { request }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool(
-                            "chrome_open_tab",
-                            json!({ "url": "https://app.schoology.com/home" }),
-                            RiskLevel::Low,
-                        ),
-                    }
+                    let mut request = tool(
+                        "browser_open",
+                        json!({ "url": "https://app.schoology.com/home" }),
+                        RiskLevel::Low,
+                    );
+                    request.expected_outcome = Some("Schoology home is loaded".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "open_assignments" => {
-                if state.last_tool_name.as_deref() == Some("chrome_click") {
+                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
                     WorkerAction::AdvanceStep {
                         note: "Opened the assignments view".to_string(),
                     }
-                } else if state.last_tool_name.as_deref() == Some("chrome_get_dom") {
-                    WorkerAction::Tool {
-                        request: tool(
-                            "chrome_click",
-                            json!({ "text": "Assignments", "text_contains": true }),
-                            RiskLevel::Medium,
-                        ),
-                    }
+                } else if matches!(state.last_tool_name.as_deref(), Some("browser_click") | Some("chrome_click")) {
+                    let mut request = tool(
+                        "browser_assert",
+                        json!({ "url_contains": "assign", "text_contains": "assignment" }),
+                        RiskLevel::Low,
+                    );
+                    request.expected_outcome = Some("Assignments view is visible".to_string());
+                    WorkerAction::Tool { request }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("chrome_get_dom", json!({}), RiskLevel::Low),
-                    }
+                    let mut request = tool(
+                        "browser_click",
+                        json!({ "text": "Assignments" }),
+                        RiskLevel::Medium,
+                    );
+                    request.expected_outcome = Some("Assignments tab opens".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "open_biology" => {
-                if state.last_tool_name.as_deref() == Some("chrome_click") {
+                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
                     WorkerAction::AdvanceStep {
-                        note: "Attempted to open the biology assignment".to_string(),
+                        note: "Opened the biology assignment".to_string(),
                     }
+                } else if matches!(state.last_tool_name.as_deref(), Some("browser_click") | Some("chrome_click")) {
+                    let mut request = tool(
+                        "browser_assert",
+                        json!({ "text_contains": "biology" }),
+                        RiskLevel::Low,
+                    );
+                    request.expected_outcome = Some("The biology assignment page is open".to_string());
+                    WorkerAction::Tool { request }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool(
-                            "chrome_click",
-                            json!({ "text": "biology", "text_contains": true }),
-                            RiskLevel::Medium,
-                        ),
-                    }
+                    let mut request = tool(
+                        "browser_click",
+                        json!({ "text": "biology" }),
+                        RiskLevel::Medium,
+                    );
+                    request.expected_outcome = Some("The latest biology assignment opens".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "summarize_assignment" => {
-                if state.last_tool_name.as_deref() == Some("chrome_get_dom") {
+                if state.last_tool_name.as_deref() == Some("browser_extract_text") {
                     let summary = summarize_text(&last_details);
                     WorkerAction::Complete {
                         message: if summary.is_empty() {
@@ -378,98 +385,110 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         },
                     }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("chrome_get_dom", json!({}), RiskLevel::Low),
-                    }
+                    let mut request = tool("browser_extract_text", json!({}), RiskLevel::Low);
+                    request.expected_outcome = Some("Assignment text is extracted".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "activate_mail" => {
-                if frontmost_app_matches(state, "Mail") {
+                if observation_proved(state) || frontmost_app_matches(state, "Mail") {
                     WorkerAction::AdvanceStep {
                         note: "Mail is active".to_string(),
                     }
                 } else if state.last_tool_name.as_deref() == Some("app_activate") {
-                    WorkerAction::Tool {
-                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
-                    }
-                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
                     WorkerAction::Replan {
                         reason: "Mail did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("app_activate", json!({ "app_name": "Mail" }), RiskLevel::Low),
-                    }
+                    let mut request = tool("app_activate", json!({ "app_name": "Mail" }), RiskLevel::Low);
+                    request.expected_outcome = Some("Mail is frontmost".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "compose_mail" => {
-                if state.last_tool_name.as_deref() == Some("mail_compose") {
+                if state.last_tool_name.as_deref() == Some("mail_compose") && observation_proved(state) {
                     WorkerAction::Complete {
                         message: "Mail draft prepared. I stopped before sending.".to_string(),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("mail_compose") {
+                    WorkerAction::Replan {
+                        reason: "Mail draft could not be verified".to_string(),
                     }
                 } else {
                     let recipient = extract_after_keyword(&state.user_request, "to");
                     let subject = extract_after_keyword(&state.user_request, "about")
                         .unwrap_or_else(|| "Jarvis follow-up".to_string());
+                    let request = ToolCallRequest {
+                        name: "mail_compose".to_string(),
+                        arguments: json!({
+                            "to": recipient,
+                            "subject": subject,
+                            "body": format!("Drafted by Jarvis for request: {}", state.user_request.trim()),
+                        }),
+                        risk: RiskLevel::Medium,
+                        requires_confirmation: false,
+                        target_identity: Some("com.apple.mail".to_string()),
+                        expected_outcome: Some("A visible Mail draft exists with the requested details".to_string()),
+                    };
                     WorkerAction::Tool {
-                        request: ToolCallRequest {
-                            name: "mail_compose".to_string(),
-                            arguments: json!({
-                                "to": recipient,
-                                "subject": subject,
-                                "body": format!("Drafted by Jarvis for request: {}", state.user_request.trim()),
-                            }),
-                            risk: RiskLevel::Medium,
-                            requires_confirmation: false,
-                            target_identity: Some("com.apple.mail".to_string()),
-                        },
+                        request,
                     }
                 }
             }
             "activate_messages" => {
-                if frontmost_app_matches(state, "Messages") {
+                if observation_proved(state) || frontmost_app_matches(state, "Messages") {
                     WorkerAction::AdvanceStep {
                         note: "Messages is active".to_string(),
                     }
                 } else if state.last_tool_name.as_deref() == Some("app_activate") {
-                    WorkerAction::Tool {
-                        request: tool("window_snapshot", json!({}), RiskLevel::Low),
-                    }
-                } else if state.last_tool_name.as_deref() == Some("window_snapshot") {
                     WorkerAction::Replan {
                         reason: "Messages did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    WorkerAction::Tool {
-                        request: tool("app_activate", json!({ "app_name": "Messages" }), RiskLevel::Low),
-                    }
+                    let mut request = tool("app_activate", json!({ "app_name": "Messages" }), RiskLevel::Low);
+                    request.expected_outcome = Some("Messages is frontmost".to_string());
+                    WorkerAction::Tool { request }
                 }
             }
             "compose_message" => {
-                if state.last_tool_name.as_deref() == Some("messages_compose") {
+                if state.last_tool_name.as_deref() == Some("messages_compose") && observation_proved(state) {
                     WorkerAction::Complete {
                         message: "Message draft prepared. I stopped before sending.".to_string(),
+                    }
+                } else if state.last_tool_name.as_deref() == Some("messages_compose") {
+                    WorkerAction::Replan {
+                        reason: "Messages draft could not be verified".to_string(),
                     }
                 } else {
                     let recipient = extract_after_keyword(&state.user_request, "message")
                         .or_else(|| extract_after_keyword(&state.user_request, "text"))
                         .unwrap_or_else(|| "the requested contact".to_string());
+                    let request = ToolCallRequest {
+                        name: "messages_compose".to_string(),
+                        arguments: json!({
+                            "recipient": recipient,
+                            "body": format!("Drafted by Jarvis for request: {}", state.user_request.trim()),
+                        }),
+                        risk: RiskLevel::Medium,
+                        requires_confirmation: false,
+                        target_identity: Some("com.apple.MobileSMS".to_string()),
+                        expected_outcome: Some("A visible Messages draft exists for the requested recipient".to_string()),
+                    };
                     WorkerAction::Tool {
-                        request: ToolCallRequest {
-                            name: "messages_compose".to_string(),
-                            arguments: json!({
-                                "recipient": recipient,
-                                "body": format!("Drafted by Jarvis for request: {}", state.user_request.trim()),
-                            }),
-                            risk: RiskLevel::High,
-                            requires_confirmation: true,
-                            target_identity: Some("com.apple.MobileSMS".to_string()),
-                        },
+                        request,
                     }
                 }
             }
             "browser_search" => {
-                if state.last_tool_name.as_deref() == Some("chrome_open_tab") {
+                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
+                    WorkerAction::Complete {
+                        message: "Opened the browser target.".to_string(),
+                    }
+                } else if matches!(state.last_tool_name.as_deref(), Some("browser_open") | Some("chrome_open_tab")) {
+                    let mut request = tool("browser_snapshot", json!({}), RiskLevel::Low);
+                    request.expected_outcome = Some("The relevant page is visible".to_string());
+                    WorkerAction::Tool { request }
+                } else if state.last_tool_name.as_deref() == Some("browser_snapshot") {
                     WorkerAction::Complete {
                         message: "Opened the browser target.".to_string(),
                     }
@@ -486,8 +505,10 @@ impl WorkerProvider for HeuristicWorkerProvider {
                             state.user_request.replace(' ', "+")
                         )
                     };
+                    let mut request = tool("browser_open", json!({ "url": search_url }), RiskLevel::Low);
+                    request.expected_outcome = Some("The browser target is visible".to_string());
                     WorkerAction::Tool {
-                        request: tool("chrome_open_tab", json!({ "url": search_url }), RiskLevel::Low),
+                        request,
                     }
                 }
             }
@@ -536,6 +557,14 @@ fn frontmost_app_matches(state: &TaskState, expected: &str) -> bool {
         .unwrap_or_default();
 
     summary.contains(&expected) || details.contains(&expected)
+}
+
+fn observation_proved(state: &TaskState) -> bool {
+    state
+        .last_observation
+        .as_ref()
+        .map(|observation| observation.proof_passed && observation.success)
+        .unwrap_or(false)
 }
 
 pub struct PlannerStack {
@@ -609,6 +638,7 @@ fn tool(name: &str, arguments: serde_json::Value, risk: RiskLevel) -> ToolCallRe
         risk,
         requires_confirmation: false,
         target_identity: None,
+        expected_outcome: None,
     }
 }
 
@@ -618,6 +648,7 @@ fn step(id: &str, title: &str, instruction: &str, completion_hint: &str) -> Plan
         title: title.to_string(),
         instruction: instruction.to_string(),
         completion_hint: completion_hint.to_string(),
+        expected_outcome: Some(completion_hint.to_string()),
         status: Default::default(),
     }
 }
@@ -663,6 +694,10 @@ mod tests {
             chrome_javascript_enabled: true,
             applescript_available: true,
             accessibility_expected: true,
+            browser_automation_ready: true,
+            browser_mode: Some("attached_existing".to_string()),
+            setup_items: Vec::new(),
+            browser_sidecar_endpoint: Some("http://127.0.0.1:4317".to_string()),
             known_apps: Vec::new(),
         }
     }
@@ -694,6 +729,61 @@ mod tests {
             target_identity: Some("com.google.Chrome".to_string()),
             success: true,
             retryable: false,
+            proof_passed: true,
+            observed_outcome: Some("Google Chrome".to_string()),
+        });
+
+        let decision = worker.next_action(&state, &caps()).await.unwrap();
+        assert!(matches!(decision.action, WorkerAction::AdvanceStep { .. }));
+    }
+
+    #[tokio::test]
+    async fn compose_mail_requires_verified_draft_before_completion() {
+        let worker = HeuristicWorkerProvider;
+        let plan = HeuristicPlannerProvider
+            .create_plan("send an email to teacher about missing homework", &caps())
+            .await
+            .unwrap();
+        let mut state = TaskState::new("send an email to teacher about missing homework".to_string(), plan);
+        state.active_step_index = 1;
+        state.last_tool_name = Some("mail_compose".to_string());
+        state.last_observation = Some(crate::llm::schema::Observation {
+            source: "mail_compose".to_string(),
+            summary: "Prepared Mail draft (verification incomplete)".to_string(),
+            details: None,
+            target_identity: Some("com.apple.mail".to_string()),
+            success: true,
+            retryable: false,
+            proof_passed: false,
+            observed_outcome: None,
+        });
+
+        let decision = worker.next_action(&state, &caps()).await.unwrap();
+        assert!(matches!(decision.action, WorkerAction::Replan { .. }));
+    }
+
+    #[tokio::test]
+    async fn schoology_step_only_advances_after_browser_proof() {
+        let worker = HeuristicWorkerProvider;
+        let plan = HeuristicPlannerProvider
+            .create_plan("open my latest biology assignment in schoology", &caps())
+            .await
+            .unwrap();
+        let mut state = TaskState::new(
+            "open my latest biology assignment in schoology".to_string(),
+            plan,
+        );
+        state.active_step_index = 1;
+        state.last_tool_name = Some("browser_assert".to_string());
+        state.last_observation = Some(crate::llm::schema::Observation {
+            source: "browser_assert".to_string(),
+            summary: "Asserted browser state (verified)".to_string(),
+            details: Some("Schoology".to_string()),
+            target_identity: Some("https://app.schoology.com/home".to_string()),
+            success: true,
+            retryable: true,
+            proof_passed: true,
+            observed_outcome: Some("Log in to Schoology".to_string()),
         });
 
         let decision = worker.next_action(&state, &caps()).await.unwrap();

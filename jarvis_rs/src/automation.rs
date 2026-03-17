@@ -9,6 +9,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use crate::browser_sidecar::{browser_target_from_value, BrowserSidecarDiagnostics, BrowserSidecarManager};
+use crate::config::AppConfig;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
@@ -53,6 +56,13 @@ pub struct AutomationCapabilities {
     pub chrome_javascript_enabled: bool,
     pub applescript_available: bool,
     pub accessibility_expected: bool,
+    pub browser_automation_ready: bool,
+    #[serde(default)]
+    pub browser_mode: Option<String>,
+    #[serde(default)]
+    pub setup_items: Vec<String>,
+    #[serde(default)]
+    pub browser_sidecar_endpoint: Option<String>,
     #[serde(default)]
     pub known_apps: Vec<AppTarget>,
 }
@@ -67,6 +77,8 @@ pub struct ToolCallRequest {
     pub requires_confirmation: bool,
     #[serde(default)]
     pub target_identity: Option<String>,
+    #[serde(default)]
+    pub expected_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +98,10 @@ pub struct ToolCallResult {
     pub target_identity: Option<String>,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub proof_passed: bool,
+    #[serde(default)]
+    pub observed_outcome: Option<String>,
 }
 
 fn default_risk_level() -> RiskLevel {
@@ -103,15 +119,25 @@ pub trait AutomationBackend: Send + Sync {
 pub struct MacAutomationBackend {
     allowed_paths: Vec<PathBuf>,
     app_aliases: HashMap<String, String>,
+    primary_browser: String,
+    browser_sidecar: BrowserSidecarManager,
 }
 
 pub type LocalAutomationBackend = MacAutomationBackend;
 
 impl MacAutomationBackend {
     pub fn new(allowed_paths: Vec<PathBuf>) -> Self {
+        let mut config = AppConfig::default();
+        config.allowed_paths = allowed_paths;
+        Self::from_config(&config)
+    }
+
+    pub fn from_config(config: &AppConfig) -> Self {
         Self {
-            allowed_paths,
+            allowed_paths: config.allowed_paths.clone(),
             app_aliases: default_app_aliases(),
+            primary_browser: config.primary_browser.clone(),
+            browser_sidecar: BrowserSidecarManager::new(config.browser.clone()),
         }
     }
 
@@ -140,6 +166,14 @@ impl MacAutomationBackend {
             "chrome_type",
             "chrome_eval",
             "chrome_screenshot",
+            "browser_attach_or_launch",
+            "browser_open",
+            "browser_wait_for",
+            "browser_click",
+            "browser_fill",
+            "browser_snapshot",
+            "browser_extract_text",
+            "browser_assert",
             "mail_compose",
             "messages_compose",
             "filesystem_list",
@@ -173,21 +207,7 @@ impl MacAutomationBackend {
     }
 
     fn chrome_javascript_enabled(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.run_applescript_lines(&vec![
-                r#"tell application "Google Chrome""#.to_string(),
-                "if (count of windows) = 0 then make new window".to_string(),
-                r#"set resultText to execute active tab of front window javascript "document.title""#.to_string(),
-                "return resultText".to_string(),
-                "end tell".to_string(),
-            ])
-            .is_ok()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        self.browser_sidecar.diagnostics().playwright_installed
     }
 
     fn is_path_allowed(&self, path: &Path) -> bool {
@@ -210,6 +230,8 @@ impl MacAutomationBackend {
             retryable: false,
             target_identity: None,
             error_code: None,
+            proof_passed: true,
+            observed_outcome: None,
         }
     }
 
@@ -308,11 +330,27 @@ impl MacAutomationBackend {
 
     #[cfg(target_os = "macos")]
     fn frontmost_app_name(&self) -> Result<String> {
-        self.run_applescript_lines(&vec![
-            r#"tell application "System Events""#.to_string(),
-            "return name of first application process whose frontmost is true".to_string(),
-            "end tell".to_string(),
-        ])
+        let output = Command::new(Self::shell_program())
+            .args(Self::shell_args("lsappinfo info -only name `lsappinfo front`"))
+            .output()
+            .context("failed to run lsappinfo")?;
+        if !output.status.success() {
+            bail!(
+                "failed to query frontmost app: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let name = stdout
+            .split('"')
+            .nth(3)
+            .map(str::to_string)
+            .or_else(|| stdout.split('=').nth(1).map(|value| value.trim_matches('"').trim().to_string()))
+            .unwrap_or_else(|| stdout.trim().to_string());
+        if name.is_empty() {
+            bail!("frontmost app query returned an empty name");
+        }
+        Ok(name)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -372,6 +410,81 @@ impl MacAutomationBackend {
             return Ok(json!({}));
         }
         serde_json::from_str(&output).or_else(|_| Ok(json!({ "raw": output })))
+    }
+
+    fn browser_diagnostics(&self) -> BrowserSidecarDiagnostics {
+        self.browser_sidecar.diagnostics()
+    }
+
+    fn accessibility_available(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.run_applescript_lines(&vec![
+                r#"tell application "System Events""#.to_string(),
+                "return count of application processes".to_string(),
+                "end tell".to_string(),
+            ])
+            .is_ok()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    async fn call_browser_tool(
+        &self,
+        tool_name: &str,
+        route: &str,
+        request_arguments: Value,
+        summary_template: &str,
+    ) -> Result<ToolCallResult> {
+        let observation = self.browser_sidecar.call(route, request_arguments).await?;
+        let mut result = ToolCallResult {
+            name: tool_name.to_string(),
+            success: observation.get("ok").and_then(Value::as_bool).unwrap_or(true),
+            summary: summary_template.to_string(),
+            output: Some(observation.to_string()),
+            artifact_path: None,
+            observation: browser_target_from_value(&observation),
+            retryable: true,
+            target_identity: observation
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error_code: None,
+            proof_passed: observation
+                .get("matched")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            observed_outcome: observation
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| observation.get("url").and_then(Value::as_str).map(str::to_string)),
+        };
+
+        if let Some(extracted) = observation.get("extractedText").and_then(Value::as_str) {
+            result.output = Some(extracted.to_string());
+            result.observation = json!({
+                "browser_name": observation.get("browserName").and_then(Value::as_str).unwrap_or("Google Chrome"),
+                "url": observation.get("url").and_then(Value::as_str),
+                "tab_hint": observation.get("title").and_then(Value::as_str),
+                "extracted_text": extracted,
+            });
+        } else if let Some(text) = observation.get("visibleText").and_then(Value::as_str) {
+            result.output = Some(text.to_string());
+        }
+
+        if let Some(matched) = observation.get("matched").and_then(Value::as_bool) {
+            result.summary = if matched {
+                format!("{} (verified)", summary_template)
+            } else {
+                format!("{} (not yet verified)", summary_template)
+            };
+        }
+
+        Ok(result)
     }
 }
 
@@ -534,29 +647,19 @@ impl AutomationBackend for MacAutomationBackend {
                 Ok(result)
             }
             "window_snapshot" => {
-                let output = self.run_applescript_lines(&vec![
-                    r#"tell application "System Events""#.to_string(),
-                    "set frontApp to first application process whose frontmost is true".to_string(),
-                    "set appName to name of frontApp".to_string(),
-                    "set windowName to \"\"".to_string(),
-                    "try".to_string(),
-                    "set windowName to name of front window of frontApp".to_string(),
-                    "end try".to_string(),
-                    "return appName & linefeed & windowName".to_string(),
-                    "end tell".to_string(),
-                ])?;
-                let mut lines = output.lines();
-                let app_name = lines.next().unwrap_or_default().to_string();
-                let window_title = lines.next().unwrap_or_default().to_string();
-                Ok(Self::summary(
+                let app_name = self.frontmost_app_name()?;
+                let window_title = String::new();
+                let mut result = Self::summary(
                     "window_snapshot",
                     format!("Front window: {} {}", app_name, window_title),
-                    Some(output),
+                    Some(app_name.clone()),
                     json!({
                         "app_name": app_name,
                         "window_title": window_title,
                     }),
-                ))
+                );
+                result.observed_outcome = Some(app_name.clone());
+                Ok(result)
             }
             "ui_list_elements" => Ok(Self::summary(
                 "ui_list_elements",
@@ -644,137 +747,83 @@ impl AutomationBackend for MacAutomationBackend {
                     json!({"amount": args.amount}),
                 ))
             }
+            "browser_attach_or_launch" => self.call_browser_tool(
+                "browser_attach_or_launch",
+                "/browser/attach_or_launch",
+                request.arguments,
+                "Attached to or launched a browser session",
+            ).await,
             "chrome_open_tab" | "browser_open" => {
                 let args: ChromeUrlArgs = serde_json::from_value(request.arguments)?;
-                let chrome = self.resolve_app_target("google chrome")?;
-                self.activate_app_target(&chrome)?;
-                self.run_applescript_lines(&vec![
-                    r#"tell application "Google Chrome""#.to_string(),
-                    "activate".to_string(),
-                    "if (count of windows) = 0 then make new window".to_string(),
-                    format!(
-                        r#"tell front window to make new tab with properties {{URL:"{}"}}"#,
-                        escape_applescript(&args.url)
-                    ),
-                    "end tell".to_string(),
-                ])?;
-                Ok(Self::summary(
-                    "chrome_open_tab",
-                    format!("Opened {}", args.url),
-                    Some(args.url.clone()),
-                    json!({
-                        "browser_name": "Google Chrome",
-                        "url": args.url,
-                    }),
-                ))
+                self.call_browser_tool(
+                    "browser_open",
+                    "/browser/open",
+                    json!({ "url": args.url }),
+                    "Opened browser page",
+                ).await
             }
-            "chrome_get_dom" => {
-                let observation = self.chrome_json_result(
-                    r#"JSON.stringify({
-                        title: document.title,
-                        url: location.href,
-                        bodyText: document.body ? document.body.innerText.slice(0, 8000) : "",
-                        links: Array.from(document.querySelectorAll("a")).slice(0, 50).map(a => ({
-                            text: (a.innerText || "").trim().slice(0, 160),
-                            href: a.href || ""
-                        }))
-                    })"#,
-                )?;
-                Ok(Self::summary(
-                    "chrome_get_dom",
-                    "Captured Chrome DOM summary",
-                    Some(observation.to_string()),
-                    observation,
-                ))
-            }
-            "chrome_click" => {
+            "chrome_get_dom" | "browser_snapshot" => self.call_browser_tool(
+                "browser_snapshot",
+                "/browser/snapshot",
+                request.arguments,
+                "Captured browser snapshot",
+            ).await,
+            "browser_wait_for" => self.call_browser_tool(
+                "browser_wait_for",
+                "/browser/wait_for",
+                request.arguments,
+                "Waited for browser state",
+            ).await,
+            "chrome_click" | "browser_click" => {
                 let args: ChromeSelectorArgs = serde_json::from_value(request.arguments)?;
-                let js = if let Some(selector) = args.selector {
-                    format!(
-                        r#"(() => {{
-                            const el = document.querySelector("{}");
-                            if (!el) return JSON.stringify({{ ok: false, error: "selector_not_found" }});
-                            el.click();
-                            return JSON.stringify({{ ok: true, mode: "selector", selector: "{}" }});
-                        }})()"#,
-                        escape_js_string(&selector),
-                        escape_js_string(&selector)
-                    )
-                } else if let Some(text) = args.text {
-                    format!(
-                        r#"(() => {{
-                            const targetText = "{}";
-                            const contains = {};
-                            const candidates = Array.from(document.querySelectorAll("a, button, [role='button'], span, div"));
-                            const el = candidates.find(node => {{
-                                const text = (node.innerText || node.textContent || "").trim();
-                                return contains ? text.toLowerCase().includes(targetText.toLowerCase()) : text.toLowerCase() === targetText.toLowerCase();
-                            }});
-                            if (!el) return JSON.stringify({{ ok: false, error: "text_not_found", text: targetText }});
-                            el.click();
-                            return JSON.stringify({{ ok: true, mode: "text", text: targetText }});
-                        }})()"#,
-                        escape_js_string(&text),
-                        if args.text_contains { "true" } else { "false" }
-                    )
-                } else {
-                    bail!("chrome_click requires selector or text");
-                };
-                let observation = self.chrome_json_result(&js)?;
-                Ok(Self::summary(
-                    "chrome_click",
-                    "Executed Chrome click",
-                    Some(observation.to_string()),
-                    observation,
-                ))
+                self.call_browser_tool(
+                    "browser_click",
+                    "/browser/click",
+                    json!({
+                        "selector": args.selector,
+                        "text": args.text,
+                        "exact": !args.text_contains,
+                    }),
+                    "Executed browser click",
+                ).await
             }
-            "chrome_type" => {
+            "chrome_type" | "browser_fill" => {
                 let args: ChromeTypeArgs = serde_json::from_value(request.arguments)?;
-                let selector = args
-                    .selector
-                    .unwrap_or_else(|| "textarea, input, [contenteditable='true']".to_string());
-                let js = format!(
-                    r#"(() => {{
-                        const el = document.querySelector("{}");
-                        if (!el) return JSON.stringify({{ ok: false, error: "selector_not_found" }});
-                        const value = "{}";
-                        if ("value" in el) {{
-                            el.focus();
-                            el.value = value;
-                            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                        }} else {{
-                            el.focus();
-                            el.textContent = value;
-                        }}
-                        if ({}) {{
-                            el.dispatchEvent(new KeyboardEvent("keydown", {{ key: "Enter", bubbles: true }}));
-                        }}
-                        return JSON.stringify({{ ok: true, selector: "{}", textLength: value.length }});
-                    }})()"#,
-                    escape_js_string(&selector),
-                    escape_js_string(&args.text),
-                    if args.submit { "true" } else { "false" },
-                    escape_js_string(&selector)
-                );
-                let observation = self.chrome_json_result(&js)?;
-                Ok(Self::summary(
-                    "chrome_type",
-                    "Executed Chrome typing",
-                    Some(observation.to_string()),
-                    observation,
-                ))
+                self.call_browser_tool(
+                    "browser_fill",
+                    "/browser/fill",
+                    json!({
+                        "selector": args.selector,
+                        "text": args.text,
+                        "submit": args.submit,
+                    }),
+                    "Filled browser field",
+                ).await
             }
             "chrome_eval" => {
                 let args: ChromeEvalArgs = serde_json::from_value(request.arguments)?;
                 let observation = self.chrome_json_result(&args.script)?;
-                Ok(Self::summary(
+                let mut result = Self::summary(
                     "chrome_eval",
                     "Executed Chrome JavaScript",
                     Some(observation.to_string()),
                     observation,
-                ))
+                );
+                result.proof_passed = true;
+                Ok(result)
             }
+            "browser_extract_text" => self.call_browser_tool(
+                "browser_extract_text",
+                "/browser/extract_text",
+                request.arguments,
+                "Extracted browser text",
+            ).await,
+            "browser_assert" => self.call_browser_tool(
+                "browser_assert",
+                "/browser/assert",
+                request.arguments,
+                "Asserted browser state",
+            ).await,
             "chrome_screenshot" | "take_screenshot" => {
                 let args: ScreenshotArgs = serde_json::from_value(request.arguments)?;
                 #[cfg(target_os = "macos")]
@@ -797,6 +846,8 @@ impl AutomationBackend for MacAutomationBackend {
                     retryable: true,
                     target_identity: None,
                     error_code: None,
+                    proof_passed: true,
+                    observed_outcome: Some(args.path),
                 })
             }
             "mail_compose" => {
@@ -811,7 +862,7 @@ impl AutomationBackend for MacAutomationBackend {
                         )
                     })
                     .unwrap_or_default();
-                self.run_applescript_lines(&vec![
+                let output = self.run_applescript_lines(&vec![
                     r#"tell application id "com.apple.mail""#.to_string(),
                     "activate".to_string(),
                     format!(
@@ -821,50 +872,91 @@ impl AutomationBackend for MacAutomationBackend {
                     ),
                     "tell newMessage".to_string(),
                     recipient_line,
+                    "delay 0.2".to_string(),
+                    "set verifiedSubject to subject of newMessage".to_string(),
+                    "set verifiedContent to content of newMessage".to_string(),
+                    "set verifiedRecipients to address of every to recipient of newMessage".to_string(),
+                    r#"return verifiedSubject & linefeed & (verifiedRecipients as string) & linefeed & verifiedContent"#.to_string(),
                     "end tell".to_string(),
                     "end tell".to_string(),
                 ])?;
-                Ok(Self::summary(
+                let mut lines = output.lines();
+                let verified_subject = lines.next().unwrap_or_default().to_string();
+                let verified_recipients = lines.next().unwrap_or_default().to_string();
+                let verified_content = lines.collect::<Vec<_>>().join("\n");
+                let proof_passed = verified_subject == args.subject
+                    && verified_content.contains(&args.body)
+                    && args
+                        .to
+                        .as_deref()
+                        .map(|to| verified_recipients.contains(to))
+                        .unwrap_or(true);
+                let mut result = Self::summary(
                     "mail_compose",
-                    "Prepared Mail draft",
-                    None,
+                    if proof_passed {
+                        "Prepared Mail draft (verified)"
+                    } else {
+                        "Prepared Mail draft (verification incomplete)"
+                    },
+                    Some(verified_content.clone()),
                     json!({
                         "to": args.to,
                         "subject": args.subject,
                         "body": args.body,
+                        "verified_recipients": verified_recipients,
                     }),
-                ))
+                );
+                result.target_identity = Some("com.apple.mail".to_string());
+                result.proof_passed = proof_passed;
+                result.observed_outcome = Some(verified_subject);
+                Ok(result)
             }
             "messages_compose" => {
                 let args: MessagesComposeArgs = serde_json::from_value(request.arguments)?;
                 let recipient = args
                     .recipient
                     .ok_or_else(|| anyhow!("messages_compose requires a recipient"))?;
-                self.activate_app_target(&AppTarget {
-                    requested_name: "Messages".to_string(),
-                    display_name: "Messages".to_string(),
-                    bundle_id: Some("com.apple.MobileSMS".to_string()),
-                    path: None,
-                })?;
-                self.run_applescript_lines(&vec![
-                    r#"tell application "System Events""#.to_string(),
-                    r#"keystroke "n" using command down"#.to_string(),
-                    "delay 0.4".to_string(),
-                    format!(r#"keystroke "{}""#, escape_applescript(&recipient)),
-                    "key code 36".to_string(),
-                    "delay 0.4".to_string(),
-                    format!(r#"keystroke "{}""#, escape_applescript(&args.body)),
+                self.run_applescript_lines(&vec![format!(
+                    r#"open location "sms:{}&body={}""#,
+                    percent_encode_for_url(&recipient),
+                    percent_encode_for_url(&args.body)
+                )])?;
+                thread::sleep(Duration::from_millis(800));
+                let frontmost = self.frontmost_app_name().unwrap_or_default();
+                let output = self.run_applescript_lines(&vec![
+                    r#"tell application id "com.apple.MobileSMS""#.to_string(),
+                    "set windowCount to count of windows".to_string(),
+                    "set frontWindowName to name of front window".to_string(),
+                    "return (windowCount as string) & linefeed & frontWindowName".to_string(),
                     "end tell".to_string(),
                 ])?;
-                Ok(Self::summary(
+                let mut lines = output.lines();
+                let window_count = lines
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_default();
+                let window_name = lines.next().unwrap_or_default().to_string();
+                let proof_passed = frontmost == "Messages" && window_count > 0;
+                let mut result = Self::summary(
                     "messages_compose",
-                    format!("Prepared message for {}", recipient),
-                    None,
+                    if proof_passed {
+                        format!("Prepared Messages draft for {} (verified window)", recipient)
+                    } else {
+                        format!("Prepared Messages draft for {} (verification incomplete)", recipient)
+                    },
+                    Some(args.body.clone()),
                     json!({
                         "recipient": recipient,
                         "body": args.body,
+                        "window_count": window_count,
+                        "window_name": window_name,
+                        "frontmost_app": frontmost,
                     }),
-                ))
+                );
+                result.target_identity = Some("com.apple.MobileSMS".to_string());
+                result.proof_passed = proof_passed;
+                result.observed_outcome = Some(window_name);
+                Ok(result)
             }
             "filesystem_list" => {
                 let args: PathArgs = serde_json::from_value(request.arguments)?;
@@ -1002,20 +1094,33 @@ impl AutomationBackend for MacAutomationBackend {
                 }
             }
             "ui_click" | "ui_type" | "ui_press_key" | "ui_select_menu" | "ui_scroll" => RiskLevel::High,
-            "chrome_eval" | "chrome_click" | "chrome_type" => RiskLevel::Medium,
-            "messages_compose" | "mail_compose" => RiskLevel::High,
+            "chrome_eval" | "chrome_click" | "chrome_type" | "browser_click" | "browser_fill" => RiskLevel::Medium,
+            "messages_compose" | "mail_compose" => RiskLevel::Medium,
             _ => request.risk,
         }
     }
 
     fn capabilities(&self) -> AutomationCapabilities {
+        let browser = self.browser_diagnostics();
+        let accessibility_expected = cfg!(target_os = "macos");
+        let accessibility_available = self.accessibility_available();
+        let mut setup_items = browser.setup_items;
+        if accessibility_expected && !accessibility_available {
+            setup_items.push(
+                "Accessibility permission is blocked for automation; native UI inspection will stay limited until macOS grants assistive access.".to_string(),
+            );
+        }
         AutomationCapabilities {
             tools: Self::tool_names(),
-            primary_browser: "Google Chrome".to_string(),
+            primary_browser: self.primary_browser.clone(),
             chrome_installed: self.chrome_installed(),
             chrome_javascript_enabled: self.chrome_javascript_enabled(),
             applescript_available: cfg!(target_os = "macos"),
-            accessibility_expected: cfg!(target_os = "macos"),
+            accessibility_expected,
+            browser_automation_ready: browser.chrome_ready && browser.playwright_installed,
+            browser_mode: browser.browser_mode,
+            setup_items,
+            browser_sidecar_endpoint: Some(browser.endpoint),
             known_apps: self.known_app_targets(),
         }
     }
@@ -1071,11 +1176,17 @@ fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn escape_js_string(value: &str) -> String {
+fn percent_encode_for_url(value: &str) -> String {
     value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            b' ' => "%20".to_string(),
+            other => format!("%{:02X}", other),
+        })
+        .collect::<String>()
 }
 
 fn applescript_key_command(key: &str, modifiers: &[String]) -> Result<String> {
@@ -1135,6 +1246,7 @@ mod tests {
             risk: RiskLevel::Low,
             requires_confirmation: false,
             target_identity: None,
+            expected_outcome: None,
         };
 
         assert_eq!(backend.classify_risk(&request), RiskLevel::High);
@@ -1172,6 +1284,7 @@ mod tests {
                 risk: RiskLevel::Low,
                 requires_confirmation: false,
                 target_identity: None,
+                expected_outcome: None,
             })
             .await
             .unwrap();

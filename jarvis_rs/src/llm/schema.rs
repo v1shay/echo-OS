@@ -21,6 +21,8 @@ pub struct PlanStep {
     #[serde(default)]
     pub completion_hint: String,
     #[serde(default)]
+    pub expected_outcome: Option<String>,
+    #[serde(default)]
     pub status: StepStatus,
 }
 
@@ -46,6 +48,10 @@ pub struct Observation {
     pub success: bool,
     #[serde(default)]
     pub retryable: bool,
+    #[serde(default)]
+    pub proof_passed: bool,
+    #[serde(default)]
+    pub observed_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Default)]
@@ -81,6 +87,8 @@ pub struct TaskState {
     pub active_browser: Option<BrowserTarget>,
     #[serde(default)]
     pub cached_ui_targets: Vec<UiElementRef>,
+    #[serde(default)]
+    pub last_expected_outcome: Option<String>,
 }
 
 impl TaskState {
@@ -97,6 +105,7 @@ impl TaskState {
             active_app: None,
             active_browser: None,
             cached_ui_targets: Vec::new(),
+            last_expected_outcome: None,
         };
         state.sync_step_statuses();
         state

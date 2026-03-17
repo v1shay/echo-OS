@@ -251,12 +251,15 @@ impl AgentRuntime {
         }
         let capabilities = self.automation.capabilities();
         self.emit(AgentEvent::Status(format!(
-            "Automation: browser={}, chrome_installed={}, chrome_js={}, applescript={}",
+            "Automation: browser={}, chrome_installed={}, browser_ready={}, applescript={}",
             capabilities.primary_browser,
             capabilities.chrome_installed,
-            capabilities.chrome_javascript_enabled,
+            capabilities.browser_automation_ready,
             capabilities.applescript_available
         )));
+        for item in &capabilities.setup_items {
+            self.emit(AgentEvent::Status(format!("Setup: {}", item)));
+        }
 
         while !commands.is_closed() || !sms_actions.is_closed() {
             tokio::select! {
@@ -469,6 +472,7 @@ impl AgentRuntime {
             "Running tool {}",
             request.name
         )));
+        state.last_expected_outcome = request.expected_outcome.clone();
         let result = self.automation.call_tool(request.clone()).await.with_context(|| {
             format!("tool {} failed while executing '{}'", request.name, state.plan.summary)
         })?;
@@ -496,6 +500,8 @@ impl AgentRuntime {
             target_identity: result.target_identity.clone(),
             success: result.success,
             retryable: result.retryable,
+            proof_passed: result.proof_passed,
+            observed_outcome: result.observed_outcome.clone(),
         });
         self.emit(AgentEvent::ObservationUpdated(result.summary.clone()));
 

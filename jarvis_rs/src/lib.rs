@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod automation;
+pub mod browser_sidecar;
 pub mod config;
 pub mod executor;
 pub mod intent;

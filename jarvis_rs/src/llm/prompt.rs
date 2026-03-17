@@ -70,7 +70,8 @@ Return ONLY valid JSON in this exact schema:
       "arguments": {{ }},
       "risk": "low|medium|high|critical",
       "requires_confirmation": false,
-      "target_identity": "optional target"
+      "target_identity": "optional target",
+      "expected_outcome": "optional proof target"
     }},
     "note": "for advance_step",
     "reason": "for replan",

@@ -36,6 +36,22 @@ pub struct AppConfig {
     pub voice_name: String,
     pub primary_browser: String,
     pub max_worker_iterations: usize,
+    pub browser: BrowserConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowserConfig {
+    pub sidecar_endpoint: String,
+    pub sidecar_host: String,
+    pub sidecar_port: u16,
+    pub sidecar_dir: PathBuf,
+    pub sidecar_entry: PathBuf,
+    pub node_binary: PathBuf,
+    pub npm_binary: PathBuf,
+    pub chrome_executable: PathBuf,
+    pub chrome_debug_port: u16,
+    pub chrome_attach_url: String,
+    pub dedicated_profile_dir: PathBuf,
 }
 
 impl Default for AppConfig {
@@ -44,7 +60,12 @@ impl Default for AppConfig {
         let home_dir = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| current_dir.clone());
+        let project_root = detect_project_root().unwrap_or_else(|| current_dir.clone());
         let default_model_path = auto_detect_llama_model();
+        let local_node_root = project_root.join(".tooling/node-v24.14.0-darwin-arm64");
+        let browser_sidecar_dir = project_root.join("browser_sidecar");
+        let browser_port = 4317;
+        let chrome_debug_port = 9222;
 
         let mut allowed_paths = vec![current_dir.clone()];
         allowed_paths.push(home_dir.join("Desktop"));
@@ -79,6 +100,21 @@ impl Default for AppConfig {
             voice_name: "Samantha".to_string(),
             primary_browser: "Google Chrome".to_string(),
             max_worker_iterations: 16,
+            browser: BrowserConfig {
+                sidecar_endpoint: format!("http://127.0.0.1:{}", browser_port),
+                sidecar_host: "127.0.0.1".to_string(),
+                sidecar_port: browser_port,
+                sidecar_dir: browser_sidecar_dir.clone(),
+                sidecar_entry: browser_sidecar_dir.join("server.mjs"),
+                node_binary: local_node_root.join("bin/node"),
+                npm_binary: local_node_root.join("bin/npm"),
+                chrome_executable: PathBuf::from(
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                ),
+                chrome_debug_port,
+                chrome_attach_url: format!("http://127.0.0.1:{}", chrome_debug_port),
+                dedicated_profile_dir: project_root.join(".tooling/browser-profile"),
+            },
         }
     }
 }
@@ -161,6 +197,43 @@ impl AppConfig {
                 config.max_worker_iterations = parsed.max(4);
             }
         }
+        if let Ok(value) = env::var("JARVIS_BROWSER_SIDECAR_ENDPOINT") {
+            config.browser.sidecar_endpoint = value;
+        }
+        if let Ok(value) = env::var("JARVIS_BROWSER_SIDECAR_HOST") {
+            config.browser.sidecar_host = value;
+        }
+        if let Ok(value) = env::var("JARVIS_BROWSER_SIDECAR_PORT") {
+            if let Ok(parsed) = value.parse::<u16>() {
+                config.browser.sidecar_port = parsed;
+            }
+        }
+        if let Ok(value) = env::var("JARVIS_BROWSER_SIDECAR_DIR") {
+            config.browser.sidecar_dir = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("JARVIS_BROWSER_SIDECAR_ENTRY") {
+            config.browser.sidecar_entry = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("JARVIS_NODE_BINARY") {
+            config.browser.node_binary = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("JARVIS_NPM_BINARY") {
+            config.browser.npm_binary = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("JARVIS_CHROME_EXECUTABLE") {
+            config.browser.chrome_executable = PathBuf::from(value);
+        }
+        if let Ok(value) = env::var("JARVIS_CHROME_DEBUG_PORT") {
+            if let Ok(parsed) = value.parse::<u16>() {
+                config.browser.chrome_debug_port = parsed;
+            }
+        }
+        if let Ok(value) = env::var("JARVIS_CHROME_ATTACH_URL") {
+            config.browser.chrome_attach_url = value;
+        }
+        if let Ok(value) = env::var("JARVIS_BROWSER_PROFILE_DIR") {
+            config.browser.dedicated_profile_dir = PathBuf::from(value);
+        }
         if let Ok(value) = env::var("JARVIS_ALLOWED_PATHS") {
             let paths = value
                 .split(':')
@@ -207,13 +280,28 @@ impl AppConfig {
         };
 
         format!(
-            "planner={} worker={} fallback={} browser={} sms={} stt={}",
-            planner, worker, fallback, self.primary_browser, sms, stt
+            "planner={} worker={} fallback={} browser={} sidecar={} sms={} stt={}",
+            planner,
+            worker,
+            fallback,
+            self.primary_browser,
+            self.browser.sidecar_endpoint,
+            sms,
+            stt
         )
     }
 }
 
-fn auto_detect_whisper_model() -> Option<PathBuf> {
+fn detect_project_root() -> Option<PathBuf> {
+    for root in project_root_candidates() {
+        if root.join("Cargo.toml").exists() && root.join("jarvis_rs").exists() {
+            return Some(root);
+        }
+    }
+    None
+}
+
+fn project_root_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(exe_path) = env::current_exe() {
@@ -222,14 +310,23 @@ fn auto_detect_whisper_model() -> Option<PathBuf> {
             .and_then(|debug| debug.parent())
             .and_then(|target| target.parent())
         {
-            candidates.push(root.join(".tooling/models/ggml-tiny.en.bin"));
-            candidates.push(root.join(".tooling/models/ggml-base.en.bin"));
+            candidates.push(root.to_path_buf());
         }
     }
 
     if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join(".tooling/models/ggml-tiny.en.bin"));
-        candidates.push(current_dir.join(".tooling/models/ggml-base.en.bin"));
+        candidates.push(current_dir);
+    }
+
+    candidates
+}
+
+fn auto_detect_whisper_model() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for root in project_root_candidates() {
+        candidates.push(root.join(".tooling/models/ggml-tiny.en.bin"));
+        candidates.push(root.join(".tooling/models/ggml-base.en.bin"));
     }
 
     candidates.push(PathBuf::from("/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin"));
@@ -241,22 +338,10 @@ fn auto_detect_whisper_model() -> Option<PathBuf> {
 fn auto_detect_llama_model() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(root) = exe_path
-            .parent()
-            .and_then(|debug| debug.parent())
-            .and_then(|target| target.parent())
-        {
-            candidates.push(root.join(".tooling/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"));
-            candidates.push(root.join(".tooling/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"));
-            candidates.push(root.join(".tooling/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"));
-        }
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join(".tooling/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"));
-        candidates.push(current_dir.join(".tooling/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"));
-        candidates.push(current_dir.join(".tooling/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"));
+    for root in project_root_candidates() {
+        candidates.push(root.join(".tooling/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"));
+        candidates.push(root.join(".tooling/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"));
+        candidates.push(root.join(".tooling/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"));
     }
 
     candidates.into_iter().find(|path| path.exists())

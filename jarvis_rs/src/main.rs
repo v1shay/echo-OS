@@ -14,7 +14,7 @@ fn main() -> Result<()> {
 
     let config = AppConfig::from_env();
     let runtime = Arc::new(tokio::runtime::Runtime::new()?);
-    let automation = Arc::new(LocalAutomationBackend::new(config.allowed_paths.clone()));
+    let automation = Arc::new(LocalAutomationBackend::from_config(&config));
     let started_agent = agent::start(runtime.handle(), config.clone(), automation);
 
     let native_options = eframe::NativeOptions {
