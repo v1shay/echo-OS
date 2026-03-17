@@ -429,6 +429,13 @@ impl AgentRuntime {
                     state = self.execute_tool(&request, state).await?;
                 }
                 WorkerAction::AdvanceStep { note } => {
+                    if !step_proved(&state) {
+                        self.emit(AgentEvent::Status(
+                            "Worker attempted to advance without proof; keeping the current step active"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
                     self.emit(AgentEvent::ObservationUpdated(note));
                     state.advance_step();
                     if state.current_step().is_none() {
@@ -454,6 +461,13 @@ impl AgentRuntime {
                     state.reset_for_replan(replanned);
                 }
                 WorkerAction::Complete { message } => {
+                    if state.current_step().is_some() && !step_proved(&state) {
+                        self.emit(AgentEvent::Status(
+                            "Worker attempted to complete the task without proof; waiting for a verified outcome"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
                     self.complete_task(&message).await;
                     return Ok(());
                 }
@@ -542,22 +556,22 @@ impl AgentRuntime {
 }
 
 fn build_planner_stack(config: &AppConfig) -> Arc<dyn PlannerProvider> {
-    let primary = Arc::new(LocalLlamaPlannerProvider::new(
+    let primary = Arc::new(HeuristicPlannerProvider) as Arc<dyn PlannerProvider>;
+    let fallback = Arc::new(LocalLlamaPlannerProvider::new(
         config.provider.planner_endpoint.clone(),
         config.provider.planner_model.clone(),
         config.provider.fallback_api_key.clone(),
     )) as Arc<dyn PlannerProvider>;
-    let fallback = Arc::new(HeuristicPlannerProvider) as Arc<dyn PlannerProvider>;
     Arc::new(PlannerStack::new(primary, fallback))
 }
 
 fn build_worker_stack(config: &AppConfig) -> Arc<dyn WorkerProvider> {
-    let primary = Arc::new(LocalLlamaWorkerProvider::new(
+    let primary = Arc::new(HeuristicWorkerProvider) as Arc<dyn WorkerProvider>;
+    let fallback = Arc::new(LocalLlamaWorkerProvider::new(
         config.provider.worker_endpoint.clone(),
         config.provider.worker_model.clone(),
         config.provider.fallback_api_key.clone(),
     )) as Arc<dyn WorkerProvider>;
-    let fallback = Arc::new(HeuristicWorkerProvider) as Arc<dyn WorkerProvider>;
     Arc::new(WorkerStack::new(primary, fallback))
 }
 
@@ -630,4 +644,12 @@ fn requires_user_approval(request: &ToolCallRequest, risk: RiskLevel) -> bool {
         request.name.as_str(),
         "filesystem_delete" | "shell_run"
     ) || matches!(risk, RiskLevel::Critical)
+}
+
+fn step_proved(state: &TaskState) -> bool {
+    state
+        .last_observation
+        .as_ref()
+        .map(|observation| observation.success && observation.proof_passed)
+        .unwrap_or(false)
 }

@@ -312,6 +312,28 @@ impl MacAutomationBackend {
             }
         }
 
+        if let Some(bundle_id) = &target.bundle_id {
+            let _ = self.run_applescript_lines(&vec![
+                format!(r#"tell application id "{}" to activate"#, escape_applescript(bundle_id)),
+            ]);
+        } else {
+            let _ = self.run_applescript_lines(&vec![
+                format!(
+                    r#"tell application "{}" to activate"#,
+                    escape_applescript(&target.display_name)
+                ),
+            ]);
+        }
+
+        for _ in 0..8 {
+            thread::sleep(Duration::from_millis(250));
+            if let Ok(frontmost) = self.frontmost_app_name() {
+                if frontmost == target.display_name {
+                    return Ok(());
+                }
+            }
+        }
+
         let actual = self
             .frontmost_app_name()
             .unwrap_or_else(|_| "unknown".to_string());
