@@ -6,19 +6,21 @@ use serde_json::json;
 pub struct OllamaClient {
     http: Client,
     base_url: String,
+    model: String,
 }
 
 impl OllamaClient {
-    pub fn new() -> Self {
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             http: Client::new(),
-            base_url: "http://localhost:11434".to_string(),
+            base_url: base_url.into(),
+            model: model.into(),
         }
     }
 
     pub async fn generate(&self, prompt: &str) -> Result<String> {
         let body = json!({
-            "model": "llama3",
+            "model": self.model,
             "prompt": prompt,
             "stream": false
         });
@@ -28,7 +30,8 @@ impl OllamaClient {
             .post(format!("{}/api/generate", self.base_url))
             .json(&body)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
         let json: serde_json::Value = response.json().await?;
 

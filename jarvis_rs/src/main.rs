@@ -1,71 +1,40 @@
-mod intent;
-mod executor;
-mod llm;
+use std::sync::Arc;
 
 use anyhow::Result;
-use intent::*;
-use llm::ollama_client::OllamaClient;
-use llm::prompt::build_intent_prompt;
-use std::io::{self, Write};
+use eframe::egui::ViewportBuilder;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+use jarvis_rs::agent;
+use jarvis_rs::app::JarvisApp;
+use jarvis_rs::automation::LocalAutomationBackend;
+use jarvis_rs::config::AppConfig;
+use jarvis_rs::logging;
 
-    let client = OllamaClient::new();
+fn main() -> Result<()> {
+    logging::init();
 
-    loop {
-        print!("Jarvis > ");
-        io::stdout().flush()?;
+    let config = AppConfig::from_env();
+    let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+    let automation = Arc::new(LocalAutomationBackend::from_config(&config));
+    let started_agent = agent::start(runtime.handle(), config.clone(), automation);
 
-        let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
-        let user_input = user_input.trim();
+    let native_options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_title("Jarvis MVP")
+            .with_inner_size([1080.0, 760.0]),
+        ..Default::default()
+    };
 
-        if user_input == "exit" {
-            break;
-        }
-
-        let prompt = build_intent_prompt(user_input);
-
-        println!("Processing...\n");
-
-        let raw_output = client.generate(&prompt).await?;
-
-        println!("Raw LLM Output:\n{}\n", raw_output);
-
-        let parsed: IntentObject = serde_json::from_str(&raw_output)?;
-
-        println!("Parsed Intent: {:?}\n", parsed);
-
-        let validated = validate_parameters(&parsed)?;
-
-        println!("Executing...\n");
-        executor::system::execute(validated)?;
-
-        println!("Done.\n");
-    }
-
-    Ok(())
-
-    mod stt;
-mod audio;
-
-use stt::WhisperSTT;
-use audio::recorder::record_wav;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    println!("Recording...");
-
-    record_wav("input.wav", 5)?;
-
-    println!("Transcribing...");
-
-    let stt = WhisperSTT::new("ggml-base.bin");
-
-    let transcript = stt.transcribe("input.wav")?;
-
-    println!("Transcript: {}", transcript);
-
-    Ok(())
+    eframe::run_native(
+        "Jarvis MVP",
+        native_options,
+        Box::new(move |_cc| {
+            Ok(Box::new(JarvisApp::new(
+                Arc::clone(&runtime),
+                config,
+                started_agent.commands,
+                started_agent.events,
+            )))
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
 }

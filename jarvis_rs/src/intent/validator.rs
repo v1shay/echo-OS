@@ -1,5 +1,5 @@
 use serde::{Deserialize};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use super::{IntentObject, IntentType};
 
 #[derive(Debug, Deserialize)]

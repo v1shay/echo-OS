@@ -1,5 +1,12 @@
+pub mod agent;
+pub mod app;
+pub mod automation;
+pub mod browser_sidecar;
+pub mod config;
 pub mod executor;
 pub mod intent;
 pub mod llm;
 pub mod logging;
 pub mod safety;
+pub mod sms;
+pub mod speech;

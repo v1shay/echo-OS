@@ -1,0 +1,5 @@
+/target
+.tooling/
+*.wav
+transcript.txt
+browser_sidecar/node_modules/
