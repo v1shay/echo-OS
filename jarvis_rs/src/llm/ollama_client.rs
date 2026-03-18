@@ -35,11 +35,7 @@ impl OllamaClient {
 
         let json: serde_json::Value = response.json().await?;
 
-        let output = json["response"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let output = json["response"].as_str().unwrap_or("").trim().to_string();
 
         Ok(output)
     }

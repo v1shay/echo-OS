@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_core;
 pub mod app;
 pub mod automation;
 pub mod browser_sidecar;

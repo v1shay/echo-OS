@@ -4,8 +4,9 @@ pub mod provider;
 pub mod schema;
 
 pub use provider::{
-    HeuristicPlannerProvider, HeuristicWorkerProvider, LocalLlamaPlannerProvider,
-    LocalLlamaWorkerProvider, PlannerProvider, PlannerStack, WorkerProvider, WorkerStack,
+    HeuristicPlannerProvider, HeuristicWorkerProvider, HostedPlannerProvider, HostedWorkerProvider,
+    LocalLlamaPlannerProvider, LocalLlamaWorkerProvider, OpenAiCompatibleClient, PlannerProvider,
+    PlannerStack, WorkerProvider, WorkerStack,
 };
 pub use schema::{
     CompletionStatus, Observation, PlanStep, StepStatus, TaskPlan, TaskState, WorkerAction,

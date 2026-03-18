@@ -56,14 +56,18 @@ impl BrowserSidecarManager {
         let node_ready = self.config.node_binary.exists();
         let npm_ready = self.config.npm_binary.exists();
         let chrome_ready = self.config.chrome_executable.exists();
-        let sidecar_files_ready = self.config.sidecar_dir.exists() && self.config.sidecar_entry.exists();
+        let sidecar_files_ready =
+            self.config.sidecar_dir.exists() && self.config.sidecar_entry.exists();
         let playwright_installed = self
             .config
             .sidecar_dir
             .join("node_modules/playwright-core")
             .exists();
         let health = self.health_sync_value();
-        let sidecar_running = health.is_some();
+        let sidecar_running = health
+            .as_ref()
+            .map(Self::payload_is_healthy)
+            .unwrap_or(false);
         let browser_mode = health
             .as_ref()
             .and_then(|value| value.get("mode"))
@@ -90,7 +94,10 @@ impl BrowserSidecarManager {
             ));
         }
         if !sidecar_running {
-            setup_items.push("Browser sidecar is not running yet; it will be started on the first browser task".to_string());
+            setup_items.push(
+                "Browser sidecar is not running yet; it will be started on the first browser task"
+                    .to_string(),
+            );
         }
 
         BrowserSidecarDiagnostics {
@@ -111,12 +118,20 @@ impl BrowserSidecarManager {
             return Ok(health);
         }
 
+        if let Some(recovered) = self.recover_existing_sidecar().await? {
+            return Ok(recovered);
+        }
+
         self.bootstrap_prerequisites()?;
+        self.cleanup_stale_listener()?;
         self.spawn_sidecar_if_needed()?;
 
         for _ in 0..30 {
             if let Some(health) = self.health().await? {
                 return Ok(health);
+            }
+            if let Some(recovered) = self.recover_existing_sidecar().await? {
+                return Ok(recovered);
             }
             thread::sleep(Duration::from_millis(200));
         }
@@ -137,7 +152,7 @@ impl BrowserSidecarManager {
         let response = self.http.post(url).json(&payload).send().await?;
         let status = response.status();
         let value: Value = response.json().await?;
-        if !status.is_success() {
+        if !status.is_success() || !Self::payload_is_healthy(&value) {
             let message = value
                 .get("error")
                 .and_then(Value::as_str)
@@ -166,7 +181,12 @@ impl BrowserSidecarManager {
                 self.config.sidecar_entry.display()
             );
         }
-        if !self.config.sidecar_dir.join("node_modules/playwright-core").exists() {
+        if !self
+            .config
+            .sidecar_dir
+            .join("node_modules/playwright-core")
+            .exists()
+        {
             bail!(
                 "Playwright sidecar dependency is missing. Install it in {} before browser tasks can run.",
                 self.config.sidecar_dir.display()
@@ -188,22 +208,18 @@ impl BrowserSidecarManager {
             *child_guard = None;
         }
 
-        std::fs::create_dir_all(&self.config.dedicated_profile_dir)
-            .with_context(|| {
-                format!(
-                    "failed to create browser profile directory {}",
-                    self.config.dedicated_profile_dir.display()
-                )
-            })?;
+        std::fs::create_dir_all(&self.config.dedicated_profile_dir).with_context(|| {
+            format!(
+                "failed to create browser profile directory {}",
+                self.config.dedicated_profile_dir.display()
+            )
+        })?;
 
         let child = Command::new(&self.config.node_binary)
             .arg(&self.config.sidecar_entry)
             .current_dir(&self.config.sidecar_dir)
             .env("JARVIS_BROWSER_HOST", &self.config.sidecar_host)
-            .env(
-                "JARVIS_BROWSER_PORT",
-                self.config.sidecar_port.to_string(),
-            )
+            .env("JARVIS_BROWSER_PORT", self.config.sidecar_port.to_string())
             .env(
                 "JARVIS_CHROME_EXECUTABLE",
                 self.config.chrome_executable.display().to_string(),
@@ -231,12 +247,81 @@ impl BrowserSidecarManager {
         Ok(())
     }
 
+    fn cleanup_stale_listener(&self) -> Result<()> {
+        let port_arg = format!("-iTCP:{}", self.config.sidecar_port);
+        let output = match Command::new("lsof")
+            .arg("-t")
+            .arg("-nP")
+            .arg(port_arg)
+            .arg("-sTCP:LISTEN")
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return Ok(()),
+        };
+
+        if !output.status.success() {
+            return Ok(());
+        }
+
+        let mut child_guard = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("browser sidecar child mutex poisoned"))?;
+
+        for pid in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|pid| !pid.is_empty())
+        {
+            if let Some(existing) = child_guard.as_mut() {
+                if existing.id().to_string() == pid {
+                    let _ = existing.kill();
+                    let _ = existing.wait();
+                    *child_guard = None;
+                    continue;
+                }
+            }
+
+            let _ = Command::new("kill").arg("-TERM").arg(pid).status();
+        }
+
+        thread::sleep(Duration::from_millis(250));
+        Ok(())
+    }
+
     async fn health(&self) -> Result<Option<Value>> {
-        let url = format!("{}/health", self.config.sidecar_endpoint.trim_end_matches('/'));
+        let url = format!(
+            "{}/health",
+            self.config.sidecar_endpoint.trim_end_matches('/')
+        );
         match self.http.get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 let value = response.json::<Value>().await?;
-                Ok(Some(value))
+                if Self::payload_is_healthy(&value) {
+                    Ok(Some(value))
+                } else {
+                    Ok(None)
+                }
+            }
+            Ok(_) => Ok(None),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn recover_existing_sidecar(&self) -> Result<Option<Value>> {
+        let url = format!(
+            "{}/browser/reset",
+            self.config.sidecar_endpoint.trim_end_matches('/')
+        );
+        match self.http.post(url).json(&json!({})).send().await {
+            Ok(response) if response.status().is_success() => {
+                let value = response.json::<Value>().await?;
+                if Self::payload_is_healthy(&value) {
+                    Ok(Some(value))
+                } else {
+                    Ok(None)
+                }
             }
             Ok(_) => Ok(None),
             Err(_) => Ok(None),
@@ -264,6 +349,10 @@ impl BrowserSidecarManager {
             .output()
             .ok()?;
         serde_json::from_slice(&output.stdout).ok()
+    }
+
+    fn payload_is_healthy(value: &Value) -> bool {
+        value.get("ok").and_then(Value::as_bool).unwrap_or(true)
     }
 
     pub fn config_paths(&self) -> Vec<PathBuf> {

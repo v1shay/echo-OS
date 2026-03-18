@@ -1,6 +1,6 @@
-use serde::{Deserialize};
-use anyhow::Result;
 use super::{IntentObject, IntentType};
+use anyhow::Result;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct OpenApplicationParams {
@@ -40,32 +40,27 @@ pub enum ValidatedParams {
 pub fn validate_parameters(intent: &IntentObject) -> Result<ValidatedParams> {
     match intent.intent {
         IntentType::OpenApplication => {
-            let params: OpenApplicationParams =
-                serde_json::from_value(intent.parameters.clone())?;
+            let params: OpenApplicationParams = serde_json::from_value(intent.parameters.clone())?;
             Ok(ValidatedParams::OpenApplication(params))
         }
 
         IntentType::ListFiles => {
-            let params: ListFilesParams =
-                serde_json::from_value(intent.parameters.clone())?;
+            let params: ListFilesParams = serde_json::from_value(intent.parameters.clone())?;
             Ok(ValidatedParams::ListFiles(params))
         }
 
         IntentType::CreateFolder => {
-            let params: CreateFolderParams =
-                serde_json::from_value(intent.parameters.clone())?;
+            let params: CreateFolderParams = serde_json::from_value(intent.parameters.clone())?;
             Ok(ValidatedParams::CreateFolder(params))
         }
 
         IntentType::DeleteFile => {
-            let params: DeleteFileParams =
-                serde_json::from_value(intent.parameters.clone())?;
+            let params: DeleteFileParams = serde_json::from_value(intent.parameters.clone())?;
             Ok(ValidatedParams::DeleteFile(params))
         }
 
         IntentType::SearchWeb => {
-            let params: SearchWebParams =
-                serde_json::from_value(intent.parameters.clone())?;
+            let params: SearchWebParams = serde_json::from_value(intent.parameters.clone())?;
             Ok(ValidatedParams::SearchWeb(params))
         }
     }

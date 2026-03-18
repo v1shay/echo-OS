@@ -15,6 +15,48 @@ let context = null;
 let page = null;
 let mode = 'uninitialized';
 
+function isRecoverableSessionError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return normalized.includes('target page, context or browser has been closed')
+    || normalized.includes('browser has been closed')
+    || normalized.includes('browser context closed')
+    || normalized.includes('context has been closed')
+    || normalized.includes('target closed')
+    || normalized.includes('connection closed')
+    || normalized.includes('browser disconnected')
+    || normalized.includes('has been collected to prevent unbounded heap growth');
+}
+
+async function clearSessionState() {
+  page = null;
+  context = null;
+  browser = null;
+  mode = 'uninitialized';
+}
+
+async function closeSessionState() {
+  const activeContext = context;
+  const activeBrowser = browser;
+  await clearSessionState();
+
+  if (activeContext) {
+    try {
+      await activeContext.close();
+    } catch (_error) {
+      // Best-effort cleanup so we can relaunch a fresh session.
+    }
+  }
+
+  if (activeBrowser && typeof activeBrowser.isConnected === 'function' && activeBrowser.isConnected()) {
+    try {
+      await activeBrowser.close();
+    } catch (_error) {
+      // CDP-attached browsers may reject close; keep cleanup best-effort.
+    }
+  }
+}
+
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, { 'content-type': 'application/json' });
   res.end(JSON.stringify(payload));
@@ -33,49 +75,72 @@ async function readBody(req) {
 }
 
 async function getActivePage() {
-  if (page && !page.isClosed()) {
+  try {
+    if (page && !page.isClosed()) {
+      return page;
+    }
+
+    if (!context) {
+      return null;
+    }
+
+    const pages = context.pages();
+    if (pages.length > 0) {
+      page = pages[0];
+      return page;
+    }
+
+    page = await context.newPage();
     return page;
+  } catch (error) {
+    if (isRecoverableSessionError(error)) {
+      await clearSessionState();
+      return null;
+    }
+    throw error;
   }
-
-  if (!context) {
-    return null;
-  }
-
-  const pages = context.pages();
-  if (pages.length > 0) {
-    page = pages[0];
-    return page;
-  }
-
-  page = await context.newPage();
-  return page;
 }
 
 async function describePage() {
-  const activePage = await getActivePage();
-  if (!activePage) {
+  try {
+    const activePage = await getActivePage();
+    if (!activePage) {
+      return {
+        ok: true,
+        ready: false,
+        mode,
+        browserName: 'Google Chrome',
+      };
+    }
+
+    const visibleText = await activePage.evaluate(() => {
+      const text = document.body ? document.body.innerText || '' : '';
+      return text.replace(/\s+/g, ' ').trim().slice(0, 6000);
+    });
+
     return {
       ok: true,
-      ready: false,
+      ready: true,
       mode,
       browserName: 'Google Chrome',
+      url: activePage.url(),
+      title: await activePage.title(),
+      visibleText,
     };
+  } catch (error) {
+    if (isRecoverableSessionError(error)) {
+      await clearSessionState();
+      return {
+        ok: false,
+        ready: false,
+        recoverable: true,
+        error: error instanceof Error ? error.message : String(error),
+        mode,
+        browserName: 'Google Chrome',
+      };
+    }
+    throw error;
   }
-
-  const visibleText = await activePage.evaluate(() => {
-    const text = document.body ? document.body.innerText || '' : '';
-    return text.replace(/\s+/g, ' ').trim().slice(0, 6000);
-  });
-
-  return {
-    ok: true,
-    ready: true,
-    mode,
-    browserName: 'Google Chrome',
-    url: activePage.url(),
-    title: await activePage.title(),
-    visibleText,
-  };
 }
 
 async function tryAttach() {
@@ -93,6 +158,7 @@ async function tryAttach() {
     page = await getActivePage();
     return true;
   } catch (_error) {
+    await clearSessionState();
     return false;
   }
 }
@@ -114,9 +180,11 @@ async function launchDedicatedProfile() {
 }
 
 async function ensureSession() {
-  if (context) {
-    await getActivePage();
-    return describePage();
+  if (context || browser || page) {
+    const existingPage = await getActivePage();
+    if (existingPage) {
+      return describePage();
+    }
   }
 
   if (!fs.existsSync(chromeExecutable)) {
@@ -129,6 +197,11 @@ async function ensureSession() {
   }
 
   return describePage();
+}
+
+async function recoverSession() {
+  await closeSessionState();
+  return ensureSession();
 }
 
 async function browserOpen(payload) {
@@ -213,6 +286,29 @@ async function browserExtractText(payload) {
   };
 }
 
+async function browserEval(payload) {
+  const activePage = await getActivePage();
+  if (!payload.script) {
+    throw new Error('browser_eval requires script');
+  }
+
+  const evaluation = await activePage.evaluate(
+    ({ script, arg }) => {
+      const fn = new Function('arg', script);
+      return fn(arg ?? null);
+    },
+    {
+      script: String(payload.script),
+      arg: payload.arg ?? null,
+    }
+  );
+
+  return {
+    ...(await describePage()),
+    evaluation,
+  };
+}
+
 async function browserAssert(payload) {
   const snapshot = await describePage();
   const url = String(snapshot.url || '').toLowerCase();
@@ -246,6 +342,9 @@ async function dispatch(pathname, payload) {
   if (pathname === '/browser/attach_or_launch') {
     return ensureSession();
   }
+  if (pathname === '/browser/reset') {
+    return recoverSession();
+  }
   await ensureSession();
   if (pathname === '/browser/open') {
     return browserOpen(payload);
@@ -264,6 +363,9 @@ async function dispatch(pathname, payload) {
   }
   if (pathname === '/browser/extract_text') {
     return browserExtractText(payload);
+  }
+  if (pathname === '/browser/eval') {
+    return browserEval(payload);
   }
   if (pathname === '/browser/assert') {
     return browserAssert(payload);

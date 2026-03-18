@@ -9,7 +9,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use crate::browser_sidecar::{browser_target_from_value, BrowserSidecarDiagnostics, BrowserSidecarManager};
+use crate::browser_sidecar::{
+    browser_target_from_value, BrowserSidecarDiagnostics, BrowserSidecarManager,
+};
 use crate::config::AppConfig;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -211,7 +213,38 @@ impl MacAutomationBackend {
     }
 
     fn is_path_allowed(&self, path: &Path) -> bool {
-        self.allowed_paths.iter().any(|allowed| path.starts_with(allowed))
+        self.allowed_paths
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
+    }
+
+    fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Ok(std::env::current_dir()
+                .context("failed to resolve current working directory")?
+                .join(path))
+        }
+    }
+
+    fn ensure_path_allowed(&self, raw: &str) -> Result<PathBuf> {
+        let path = self.resolve_path(raw)?;
+        if self.is_path_allowed(&path) {
+            Ok(path)
+        } else {
+            bail!(
+                "path {} is outside the allowed automation roots",
+                path.display()
+            )
+        }
+    }
+
+    fn ensure_move_paths_allowed(&self, from: &str, to: &str) -> Result<(PathBuf, PathBuf)> {
+        let from_path = self.ensure_path_allowed(from)?;
+        let to_path = self.ensure_path_allowed(to)?;
+        Ok((from_path, to_path))
     }
 
     fn summary(
@@ -241,14 +274,28 @@ impl MacAutomationBackend {
             bail!("app name cannot be empty");
         }
 
-        let normalized = normalize_name(requested);
-        if let Some(bundle_id) = self.app_aliases.get(&normalized) {
-            return Ok(AppTarget {
-                requested_name: requested.to_string(),
-                display_name: canonical_display_name(bundle_id),
-                bundle_id: Some(bundle_id.clone()),
-                path: None,
-            });
+        let candidates = app_name_candidates(requested);
+        for candidate in &candidates {
+            if let Some(bundle_id) = self.app_aliases.get(candidate) {
+                return Ok(AppTarget {
+                    requested_name: requested.to_string(),
+                    display_name: canonical_display_name(bundle_id),
+                    bundle_id: Some(bundle_id.clone()),
+                    path: None,
+                });
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        for running_name in self.running_app_names()? {
+            if app_name_matches(&candidates, &running_name) {
+                return Ok(AppTarget {
+                    requested_name: requested.to_string(),
+                    display_name: running_name,
+                    bundle_id: None,
+                    path: None,
+                });
+            }
         }
 
         for directory in app_search_paths() {
@@ -271,7 +318,7 @@ impl MacAutomationBackend {
                         .and_then(|value| value.to_str())
                         .unwrap_or_default()
                         .to_string();
-                    if normalize_name(&display_name).contains(&normalized) {
+                    if app_name_matches(&candidates, &display_name) {
                         return Ok(AppTarget {
                             requested_name: requested.to_string(),
                             display_name,
@@ -287,7 +334,37 @@ impl MacAutomationBackend {
     }
 
     #[cfg(target_os = "macos")]
+    fn running_app_names(&self) -> Result<Vec<String>> {
+        let output = self.run_applescript_lines(&vec![
+            r#"tell application "System Events""#.to_string(),
+            r#"get the name of every application process whose background only is false"#
+                .to_string(),
+            "end tell".to_string(),
+        ])?;
+        Ok(output
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    #[cfg(target_os = "macos")]
     fn activate_app_target(&self, target: &AppTarget) -> Result<()> {
+        let _ = self.run_applescript_lines(&vec![format!(
+            r#"tell application "{}" to activate"#,
+            escape_applescript(&target.display_name)
+        )]);
+
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(250));
+            if let Ok(frontmost) = self.frontmost_app_name() {
+                if frontmost == target.display_name {
+                    return Ok(());
+                }
+            }
+        }
+
         let mut command = Command::new("open");
         if let Some(bundle_id) = &target.bundle_id {
             command.arg("-b").arg(bundle_id);
@@ -301,28 +378,6 @@ impl MacAutomationBackend {
             .with_context(|| format!("failed to activate {}", target.display_name))?;
         if !status.success() {
             bail!("macOS failed to launch {}", target.display_name);
-        }
-
-        for _ in 0..5 {
-            thread::sleep(Duration::from_millis(250));
-            if let Ok(frontmost) = self.frontmost_app_name() {
-                if frontmost == target.display_name {
-                    return Ok(());
-                }
-            }
-        }
-
-        if let Some(bundle_id) = &target.bundle_id {
-            let _ = self.run_applescript_lines(&vec![
-                format!(r#"tell application id "{}" to activate"#, escape_applescript(bundle_id)),
-            ]);
-        } else {
-            let _ = self.run_applescript_lines(&vec![
-                format!(
-                    r#"tell application "{}" to activate"#,
-                    escape_applescript(&target.display_name)
-                ),
-            ]);
         }
 
         for _ in 0..8 {
@@ -352,23 +407,11 @@ impl MacAutomationBackend {
 
     #[cfg(target_os = "macos")]
     fn frontmost_app_name(&self) -> Result<String> {
-        let output = Command::new(Self::shell_program())
-            .args(Self::shell_args("lsappinfo info -only name `lsappinfo front`"))
-            .output()
-            .context("failed to run lsappinfo")?;
-        if !output.status.success() {
-            bail!(
-                "failed to query frontmost app: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let name = stdout
-            .split('"')
-            .nth(3)
-            .map(str::to_string)
-            .or_else(|| stdout.split('=').nth(1).map(|value| value.trim_matches('"').trim().to_string()))
-            .unwrap_or_else(|| stdout.trim().to_string());
+        let name = self.run_applescript_lines(&vec![
+            r#"tell application "System Events""#.to_string(),
+            r#"return name of first application process whose frontmost is true"#.to_string(),
+            "end tell".to_string(),
+        ])?;
         if name.is_empty() {
             bail!("frontmost app query returned an empty name");
         }
@@ -406,7 +449,8 @@ impl MacAutomationBackend {
         let lines = vec![
             r#"tell application "Google Chrome""#.to_string(),
             "activate".to_string(),
-            r#"if (count of windows) = 0 then error "Google Chrome has no open windows""#.to_string(),
+            r#"if (count of windows) = 0 then error "Google Chrome has no open windows""#
+                .to_string(),
             format!(
                 r#"set resultText to execute active tab of front window javascript "{}""#,
                 escape_applescript(script)
@@ -464,7 +508,10 @@ impl MacAutomationBackend {
         let observation = self.browser_sidecar.call(route, request_arguments).await?;
         let mut result = ToolCallResult {
             name: tool_name.to_string(),
-            success: observation.get("ok").and_then(Value::as_bool).unwrap_or(true),
+            success: observation
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             summary: summary_template.to_string(),
             output: Some(observation.to_string()),
             artifact_path: None,
@@ -478,12 +525,17 @@ impl MacAutomationBackend {
             proof_passed: observation
                 .get("matched")
                 .and_then(Value::as_bool)
-                .unwrap_or(true),
+                .unwrap_or(false),
             observed_outcome: observation
                 .get("title")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .or_else(|| observation.get("url").and_then(Value::as_str).map(str::to_string)),
+                .or_else(|| {
+                    observation
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
         };
 
         if let Some(extracted) = observation.get("extractedText").and_then(Value::as_str) {
@@ -680,6 +732,7 @@ impl AutomationBackend for MacAutomationBackend {
                         "window_title": window_title,
                     }),
                 );
+                result.proof_passed = false;
                 result.observed_outcome = Some(app_name.clone());
                 Ok(result)
             }
@@ -699,12 +752,14 @@ impl AutomationBackend for MacAutomationBackend {
                     "end tell".to_string(),
                 ];
                 self.run_applescript_lines(&script)?;
-                Ok(Self::summary(
+                let mut result = Self::summary(
                     "ui_click",
                     format!("Clicked {}", args.label),
                     None,
                     json!({"label": args.label}),
-                ))
+                );
+                result.proof_passed = false;
+                Ok(result)
             }
             "ui_type" => {
                 let args: UiTypeArgs = serde_json::from_value(request.arguments)?;
@@ -713,12 +768,14 @@ impl AutomationBackend for MacAutomationBackend {
                     format!(r#"keystroke "{}""#, escape_applescript(&args.text)),
                     "end tell".to_string(),
                 ])?;
-                Ok(Self::summary(
+                let mut result = Self::summary(
                     "ui_type",
                     "Typed text".to_string(),
                     None,
                     json!({"text_len": args.text.chars().count()}),
-                ))
+                );
+                result.proof_passed = false;
+                Ok(result)
             }
             "ui_press_key" => {
                 let args: UiPressKeyArgs = serde_json::from_value(request.arguments)?;
@@ -728,12 +785,14 @@ impl AutomationBackend for MacAutomationBackend {
                     key_command,
                     "end tell".to_string(),
                 ])?;
-                Ok(Self::summary(
+                let mut result = Self::summary(
                     "ui_press_key",
                     format!("Pressed {}", args.key),
                     None,
                     json!({"key": args.key, "modifiers": args.modifiers}),
-                ))
+                );
+                result.proof_passed = false;
+                Ok(result)
             }
             "ui_select_menu" => {
                 let args: UiSelectMenuArgs = serde_json::from_value(request.arguments)?;
@@ -748,26 +807,33 @@ impl AutomationBackend for MacAutomationBackend {
                     "end tell".to_string(),
                     "end tell".to_string(),
                 ])?;
-                Ok(Self::summary(
+                let mut result = Self::summary(
                     "ui_select_menu",
                     format!("Selected {} > {}", args.menu, args.item),
                     None,
                     json!({"menu": args.menu, "item": args.item}),
-                ))
+                );
+                result.proof_passed = false;
+                Ok(result)
             }
             "ui_scroll" => {
                 let args: UiScrollArgs = serde_json::from_value(request.arguments)?;
-                self.run_applescript_lines(&vec![
-                    r#"tell application "System Events""#.to_string(),
-                    format!("key code 125 {}", if args.amount < 0 { "" } else { "" }),
-                    "end tell".to_string(),
-                ])?;
-                Ok(Self::summary(
+                let steps = args.amount.abs().max(1).min(40);
+                let key_code = if args.amount < 0 { 126 } else { 125 };
+                let mut script = vec![r#"tell application "System Events""#.to_string()];
+                for _ in 0..steps {
+                    script.push(format!("key code {}", key_code));
+                }
+                script.push("end tell".to_string());
+                self.run_applescript_lines(&script)?;
+                let mut result = Self::summary(
                     "ui_scroll",
                     format!("Requested scroll {}", args.amount),
                     None,
                     json!({"amount": args.amount}),
-                ))
+                );
+                result.proof_passed = false;
+                Ok(result)
             }
             "browser_attach_or_launch" => self.call_browser_tool(
                 "browser_attach_or_launch",
@@ -848,28 +914,34 @@ impl AutomationBackend for MacAutomationBackend {
             ).await,
             "chrome_screenshot" | "take_screenshot" => {
                 let args: ScreenshotArgs = serde_json::from_value(request.arguments)?;
+                let target_path = self.ensure_path_allowed(&args.path)?;
                 #[cfg(target_os = "macos")]
-                let status = Command::new("screencapture").arg("-x").arg(&args.path).status();
+                let status = Command::new("screencapture")
+                    .arg("-x")
+                    .arg(&target_path)
+                    .status();
                 #[cfg(not(target_os = "macos"))]
                 let status = Command::new(Self::shell_program())
                     .args(Self::shell_args(&format!(
                         "which gnome-screenshot >/dev/null && gnome-screenshot -f '{}'",
-                        args.path
+                        target_path.display()
                     )))
                     .status();
-                status.with_context(|| format!("failed to capture screenshot to {}", args.path))?;
+                status.with_context(|| {
+                    format!("failed to capture screenshot to {}", target_path.display())
+                })?;
                 Ok(ToolCallResult {
                     name: request.name,
                     success: true,
-                    summary: format!("Captured screenshot to {}", args.path),
+                    summary: format!("Captured screenshot to {}", target_path.display()),
                     output: None,
-                    artifact_path: Some(PathBuf::from(&args.path)),
-                    observation: json!({ "path": args.path }),
+                    artifact_path: Some(target_path.clone()),
+                    observation: json!({ "path": target_path.display().to_string() }),
                     retryable: true,
                     target_identity: None,
                     error_code: None,
                     proof_passed: true,
-                    observed_outcome: Some(args.path),
+                    observed_outcome: Some(target_path.display().to_string()),
                 })
             }
             "mail_compose" => {
@@ -884,8 +956,8 @@ impl AutomationBackend for MacAutomationBackend {
                         )
                     })
                     .unwrap_or_default();
-                let output = self.run_applescript_lines(&vec![
-                    r#"tell application id "com.apple.mail""#.to_string(),
+                self.run_applescript_lines(&vec![
+                    r#"tell application "Mail""#.to_string(),
                     "activate".to_string(),
                     format!(
                         r#"set newMessage to make new outgoing message with properties {{visible:true, subject:"{}", content:"{}"}}"#,
@@ -894,18 +966,47 @@ impl AutomationBackend for MacAutomationBackend {
                     ),
                     "tell newMessage".to_string(),
                     recipient_line,
-                    "delay 0.2".to_string(),
-                    "set verifiedSubject to subject of newMessage".to_string(),
-                    "set verifiedContent to content of newMessage".to_string(),
-                    "set verifiedRecipients to address of every to recipient of newMessage".to_string(),
-                    r#"return verifiedSubject & linefeed & (verifiedRecipients as string) & linefeed & verifiedContent"#.to_string(),
                     "end tell".to_string(),
                     "end tell".to_string(),
                 ])?;
-                let mut lines = output.lines();
-                let verified_subject = lines.next().unwrap_or_default().to_string();
-                let verified_recipients = lines.next().unwrap_or_default().to_string();
-                let verified_content = lines.collect::<Vec<_>>().join("\n");
+                let verification_script = vec![
+                    r#"tell application "Mail""#.to_string(),
+                    format!(
+                        r#"set matchingMessages to every outgoing message whose subject is "{}""#,
+                        escape_applescript(&args.subject)
+                    ),
+                    r#"if (count of matchingMessages) = 0 then error "No matching Mail draft was found yet""#
+                        .to_string(),
+                    "set verifiedMessage to item (count of matchingMessages) of matchingMessages"
+                        .to_string(),
+                    "set verifiedSubject to subject of verifiedMessage".to_string(),
+                    "set verifiedContent to content of verifiedMessage".to_string(),
+                    "set verifiedRecipients to address of every to recipient of verifiedMessage"
+                        .to_string(),
+                    r#"return verifiedSubject & linefeed & (verifiedRecipients as string) & linefeed & verifiedContent"#
+                        .to_string(),
+                    "end tell".to_string(),
+                ];
+
+                let mut verification_error = None;
+                let mut verified_subject = String::new();
+                let mut verified_recipients = String::new();
+                let mut verified_content = String::new();
+                for _ in 0..8 {
+                    thread::sleep(Duration::from_millis(250));
+                    match self.run_applescript_lines(&verification_script) {
+                        Ok(output) => {
+                            let mut lines = output.lines();
+                            verified_subject = lines.next().unwrap_or_default().to_string();
+                            verified_recipients = lines.next().unwrap_or_default().to_string();
+                            verified_content = lines.collect::<Vec<_>>().join("\n");
+                            verification_error = None;
+                            break;
+                        }
+                        Err(error) => verification_error = Some(error.to_string()),
+                    }
+                }
+
                 let proof_passed = verified_subject == args.subject
                     && verified_content.contains(&args.body)
                     && args
@@ -920,12 +1021,17 @@ impl AutomationBackend for MacAutomationBackend {
                     } else {
                         "Prepared Mail draft (verification incomplete)"
                     },
-                    Some(verified_content.clone()),
+                    Some(if verified_content.is_empty() {
+                        args.body.clone()
+                    } else {
+                        verified_content.clone()
+                    }),
                     json!({
                         "to": args.to,
                         "subject": args.subject,
                         "body": args.body,
                         "verified_recipients": verified_recipients,
+                        "verification_error": verification_error,
                     }),
                 );
                 result.target_identity = Some("com.apple.mail".to_string());
@@ -946,7 +1052,7 @@ impl AutomationBackend for MacAutomationBackend {
                 thread::sleep(Duration::from_millis(800));
                 let frontmost = self.frontmost_app_name().unwrap_or_default();
                 let output = self.run_applescript_lines(&vec![
-                    r#"tell application id "com.apple.MobileSMS""#.to_string(),
+                    r#"tell application "Messages""#.to_string(),
                     "set windowCount to count of windows".to_string(),
                     "set frontWindowName to name of front window".to_string(),
                     "return (windowCount as string) & linefeed & frontWindowName".to_string(),
@@ -982,77 +1088,90 @@ impl AutomationBackend for MacAutomationBackend {
             }
             "filesystem_list" => {
                 let args: PathArgs = serde_json::from_value(request.arguments)?;
-                let entries = fs::read_dir(&args.path)
-                    .with_context(|| format!("failed to list {}", args.path))?
+                let path = self.ensure_path_allowed(&args.path)?;
+                let entries = fs::read_dir(&path)
+                    .with_context(|| format!("failed to list {}", path.display()))?
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.file_name().to_string_lossy().to_string())
                     .collect::<Vec<_>>();
                 Ok(Self::summary(
                     "filesystem_list",
-                    format!("Listed {}", args.path),
+                    format!("Listed {}", path.display()),
                     Some(entries.join("\n")),
-                    json!({ "path": args.path, "entries": entries }),
+                    json!({ "path": path.display().to_string(), "entries": entries }),
                 ))
             }
             "filesystem_create_folder" => {
                 let args: PathArgs = serde_json::from_value(request.arguments)?;
-                fs::create_dir_all(&args.path)
-                    .with_context(|| format!("failed to create {}", args.path))?;
+                let path = self.ensure_path_allowed(&args.path)?;
+                fs::create_dir_all(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
                 Ok(Self::summary(
                     "filesystem_create_folder",
-                    format!("Created folder {}", args.path),
+                    format!("Created folder {}", path.display()),
                     None,
-                    json!({ "path": args.path }),
+                    json!({ "path": path.display().to_string() }),
                 ))
             }
             "filesystem_read_file" => {
                 let args: PathArgs = serde_json::from_value(request.arguments)?;
-                let contents =
-                    fs::read_to_string(&args.path).with_context(|| format!("failed to read {}", args.path))?;
+                let path = self.ensure_path_allowed(&args.path)?;
+                let contents = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
                 Ok(Self::summary(
                     "filesystem_read_file",
-                    format!("Read {}", args.path),
+                    format!("Read {}", path.display()),
                     Some(contents.clone()),
-                    json!({ "path": args.path, "size": contents.len() }),
+                    json!({ "path": path.display().to_string(), "size": contents.len() }),
                 ))
             }
             "filesystem_write_file" => {
                 let args: WriteFileArgs = serde_json::from_value(request.arguments)?;
-                fs::write(&args.path, &args.contents)
-                    .with_context(|| format!("failed to write {}", args.path))?;
+                let path = self.ensure_path_allowed(&args.path)?;
+                fs::write(&path, &args.contents)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
                 Ok(Self::summary(
                     "filesystem_write_file",
-                    format!("Wrote {}", args.path),
+                    format!("Wrote {}", path.display()),
                     None,
-                    json!({ "path": args.path, "size": args.contents.len() }),
+                    json!({ "path": path.display().to_string(), "size": args.contents.len() }),
                 ))
             }
             "filesystem_move" => {
                 let args: MovePathArgs = serde_json::from_value(request.arguments)?;
-                fs::rename(&args.from, &args.to)
-                    .with_context(|| format!("failed to move {} to {}", args.from, args.to))?;
+                let (from_path, to_path) = self.ensure_move_paths_allowed(&args.from, &args.to)?;
+                fs::rename(&from_path, &to_path).with_context(|| {
+                    format!(
+                        "failed to move {} to {}",
+                        from_path.display(),
+                        to_path.display()
+                    )
+                })?;
                 Ok(Self::summary(
                     "filesystem_move",
-                    format!("Moved {} to {}", args.from, args.to),
+                    format!("Moved {} to {}", from_path.display(), to_path.display()),
                     None,
-                    json!({ "from": args.from, "to": args.to }),
+                    json!({
+                        "from": from_path.display().to_string(),
+                        "to": to_path.display().to_string()
+                    }),
                 ))
             }
             "filesystem_delete" => {
                 let args: PathArgs = serde_json::from_value(request.arguments)?;
-                let path = PathBuf::from(&args.path);
+                let path = self.ensure_path_allowed(&args.path)?;
                 if path.is_dir() {
                     fs::remove_dir_all(&path)
-                        .with_context(|| format!("failed to remove directory {}", args.path))?;
+                        .with_context(|| format!("failed to remove directory {}", path.display()))?;
                 } else {
                     fs::remove_file(&path)
-                        .with_context(|| format!("failed to remove file {}", args.path))?;
+                        .with_context(|| format!("failed to remove file {}", path.display()))?;
                 }
                 Ok(Self::summary(
                     "filesystem_delete",
-                    format!("Deleted {}", args.path),
+                    format!("Deleted {}", path.display()),
                     None,
-                    json!({ "path": args.path }),
+                    json!({ "path": path.display().to_string() }),
                 ))
             }
             "shell_run" => {
@@ -1093,7 +1212,13 @@ impl AutomationBackend for MacAutomationBackend {
                     .get("path")
                     .and_then(Value::as_str)
                     .map(PathBuf::from)
-                    .or_else(|| request.arguments.get("to").and_then(Value::as_str).map(PathBuf::from));
+                    .or_else(|| {
+                        request
+                            .arguments
+                            .get("to")
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                    });
                 match path {
                     Some(path) if self.is_path_allowed(&path) => RiskLevel::Medium,
                     Some(_) => RiskLevel::High,
@@ -1115,8 +1240,12 @@ impl AutomationBackend for MacAutomationBackend {
                     RiskLevel::High
                 }
             }
-            "ui_click" | "ui_type" | "ui_press_key" | "ui_select_menu" | "ui_scroll" => RiskLevel::High,
-            "chrome_eval" | "chrome_click" | "chrome_type" | "browser_click" | "browser_fill" => RiskLevel::Medium,
+            "ui_click" | "ui_type" | "ui_press_key" | "ui_select_menu" | "ui_scroll" => {
+                RiskLevel::High
+            }
+            "chrome_eval" | "chrome_click" | "chrome_type" | "browser_click" | "browser_fill" => {
+                RiskLevel::Medium
+            }
             "messages_compose" | "mail_compose" => RiskLevel::Medium,
             _ => request.risk,
         }
@@ -1149,7 +1278,10 @@ impl AutomationBackend for MacAutomationBackend {
 }
 
 fn app_search_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("/Applications"), PathBuf::from("/System/Applications")];
+    let mut paths = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+    ];
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         paths.push(home.join("Applications"));
     }
@@ -1179,6 +1311,47 @@ fn normalize_name(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn app_name_candidates(value: &str) -> Vec<String> {
+    let normalized = normalize_name(value);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![normalized.clone()];
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    let significant_tokens: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|token| !is_ignorable_app_token(token))
+        .collect();
+    let significant = significant_tokens.join(" ");
+    if !significant.is_empty() && significant != normalized {
+        candidates.push(significant);
+    }
+
+    candidates
+}
+
+fn app_name_matches(candidates: &[String], display_name: &str) -> bool {
+    let normalized_display_name = normalize_name(display_name);
+    candidates.iter().any(|candidate| {
+        normalized_display_name.contains(candidate)
+            || candidate.contains(&normalized_display_name)
+            || normalized_display_name.split_whitespace().any(|token| {
+                candidate
+                    .split_whitespace()
+                    .any(|candidate_token| candidate_token == token)
+            })
+    })
+}
+
+fn is_ignorable_app_token(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an" | "the" | "app" | "application" | "local" | "desktop"
+    )
 }
 
 fn canonical_display_name(bundle_id: &str) -> String {
@@ -1239,7 +1412,9 @@ fn applescript_key_command(key: &str, modifiers: &[String]) -> Result<String> {
         "down" => format!("key code 125{}", using),
         "left" => format!("key code 123{}", using),
         "right" => format!("key code 124{}", using),
-        value if value.len() == 1 => format!(r#"keystroke "{}"{}"#, escape_applescript(value), using),
+        value if value.len() == 1 => {
+            format!(r#"keystroke "{}"{}"#, escape_applescript(value), using)
+        }
         _ => bail!("unsupported key '{}'", key),
     };
 
@@ -1284,6 +1459,21 @@ mod tests {
     }
 
     #[test]
+    fn resolves_voice_friendly_alias_with_filler_words() {
+        let backend = MacAutomationBackend::new(vec![std::env::temp_dir()]);
+        let target = backend.resolve_app_target("local Chrome").unwrap();
+
+        assert_eq!(target.bundle_id.as_deref(), Some("com.google.Chrome"));
+        assert_eq!(target.display_name, "Google Chrome");
+    }
+
+    #[test]
+    fn bidirectional_app_name_matching_handles_longer_display_names() {
+        let candidates = app_name_candidates("Arduino IDE");
+        assert!(app_name_matches(&candidates, "Arduino Uno IDE"));
+    }
+
+    #[test]
     fn unknown_app_returns_error() {
         let backend = MacAutomationBackend::new(vec![std::env::temp_dir()]);
         let result = backend.resolve_app_target("totally imaginary app name");
@@ -1312,5 +1502,28 @@ mod tests {
             .unwrap();
 
         assert!(result.output.unwrap_or_default().contains("demo.txt"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_write_rejects_paths_outside_allowlist() {
+        let backend = MacAutomationBackend::new(vec![std::env::temp_dir().join("allowed-only")]);
+        let denied_path = std::env::temp_dir()
+            .join("outside-allowed")
+            .join("blocked.txt");
+        let result = backend
+            .call_tool(ToolCallRequest {
+                name: "filesystem_write_file".to_string(),
+                arguments: json!({
+                    "path": denied_path.display().to_string(),
+                    "contents": "blocked",
+                }),
+                risk: RiskLevel::Low,
+                requires_confirmation: false,
+                target_identity: None,
+                expected_outcome: None,
+            })
+            .await;
+
+        assert!(result.is_err());
     }
 }

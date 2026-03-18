@@ -195,7 +195,8 @@ impl eframe::App for JarvisApp {
                             .desired_width(f32::INFINITY)
                             .hint_text("Tell Jarvis what to do"),
                     );
-                    if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     {
                         self.submit_text();
                     }
@@ -209,7 +210,11 @@ impl eframe::App for JarvisApp {
                         let _ = self.commands.send(AgentCommand::StartListening);
                     }
                     if ui
-                        .button(if self.speech_muted { "Unmute Speech" } else { "Mute Speech" })
+                        .button(if self.speech_muted {
+                            "Unmute Speech"
+                        } else {
+                            "Mute Speech"
+                        })
                         .clicked()
                     {
                         self.speech_muted = !self.speech_muted;

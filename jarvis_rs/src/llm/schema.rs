@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::agent_core::{TaskJournal, VerificationResult};
 use crate::automation::{AppTarget, BrowserTarget, ToolCallRequest, UiElementRef};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +90,10 @@ pub struct TaskState {
     pub cached_ui_targets: Vec<UiElementRef>,
     #[serde(default)]
     pub last_expected_outcome: Option<String>,
+    #[serde(default)]
+    pub journal: TaskJournal,
+    #[serde(default)]
+    pub final_verification: Option<VerificationResult>,
 }
 
 impl TaskState {
@@ -106,6 +111,8 @@ impl TaskState {
             active_browser: None,
             cached_ui_targets: Vec::new(),
             last_expected_outcome: None,
+            journal: TaskJournal::default(),
+            final_verification: None,
         };
         state.sync_step_statuses();
         state

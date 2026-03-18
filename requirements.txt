@@ -1,0 +1,5 @@
+numpy>=2.2.0
+Pillow>=11.1.0
+PyAutoGUI>=0.9.54
+sounddevice>=0.5.1
+soundfile>=0.13.1

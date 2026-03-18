@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -9,22 +10,30 @@ use serde_json::json;
 use crate::automation::{AutomationCapabilities, RiskLevel, ToolCallRequest};
 
 use super::prompt::{build_planner_prompt, build_worker_prompt};
-use super::schema::{PlanStep, TaskPlan, TaskState, WorkerDecision, WorkerAction};
+use super::schema::{PlanStep, TaskPlan, TaskState, WorkerAction, WorkerDecision};
 
 #[async_trait]
 pub trait PlannerProvider: Send + Sync {
-    async fn create_plan(&self, task_input: &str, capabilities: &AutomationCapabilities) -> Result<TaskPlan>;
+    async fn create_plan(
+        &self,
+        task_input: &str,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<TaskPlan>;
     fn provider_name(&self) -> &'static str;
 }
 
 #[async_trait]
 pub trait WorkerProvider: Send + Sync {
-    async fn next_action(&self, state: &TaskState, capabilities: &AutomationCapabilities) -> Result<WorkerDecision>;
+    async fn next_action(
+        &self,
+        state: &TaskState,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<WorkerDecision>;
     fn provider_name(&self) -> &'static str;
 }
 
 #[derive(Clone)]
-struct OpenAiCompatibleClient {
+pub struct OpenAiCompatibleClient {
     base_url: String,
     model: String,
     api_key: Option<String>,
@@ -32,16 +41,23 @@ struct OpenAiCompatibleClient {
 }
 
 impl OpenAiCompatibleClient {
-    fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
         Self {
             base_url,
             model,
             api_key,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 
-    async fn parse_json<T: DeserializeOwned>(&self, system_prompt: &str, user_prompt: &str) -> Result<T> {
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut request = self.http.post(endpoint).json(&json!({
             "model": self.model,
@@ -56,13 +72,25 @@ impl OpenAiCompatibleClient {
         }
         let response = request.send().await?.error_for_status()?;
         let body: serde_json::Value = response.json().await?;
-        let content = body["choices"][0]["message"]["content"]
+        Ok(body["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
             .trim()
-            .to_string();
+            .to_string())
+    }
+
+    async fn parse_json<T: DeserializeOwned>(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<T> {
+        let content = self.chat_completion(system_prompt, user_prompt).await?;
         serde_json::from_str(&content)
             .with_context(|| format!("model {} returned invalid JSON: {}", self.model, content))
+    }
+
+    pub async fn complete_text(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        self.chat_completion(system_prompt, user_prompt).await
     }
 }
 
@@ -81,7 +109,11 @@ impl LocalLlamaPlannerProvider {
 
 #[async_trait]
 impl PlannerProvider for LocalLlamaPlannerProvider {
-    async fn create_plan(&self, task_input: &str, capabilities: &AutomationCapabilities) -> Result<TaskPlan> {
+    async fn create_plan(
+        &self,
+        task_input: &str,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<TaskPlan> {
         self.client
             .parse_json(
                 "You are Jarvis Planner. Return strict JSON only.",
@@ -92,6 +124,39 @@ impl PlannerProvider for LocalLlamaPlannerProvider {
 
     fn provider_name(&self) -> &'static str {
         "local-llama-planner"
+    }
+}
+
+#[derive(Clone)]
+pub struct HostedPlannerProvider {
+    client: OpenAiCompatibleClient,
+}
+
+impl HostedPlannerProvider {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
+        Self {
+            client: OpenAiCompatibleClient::new(base_url, model, api_key),
+        }
+    }
+}
+
+#[async_trait]
+impl PlannerProvider for HostedPlannerProvider {
+    async fn create_plan(
+        &self,
+        task_input: &str,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<TaskPlan> {
+        self.client
+            .parse_json(
+                "You are Jarvis Planner. Return strict JSON only.",
+                &build_planner_prompt(task_input, capabilities),
+            )
+            .await
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "hosted-openai-planner"
     }
 }
 
@@ -110,7 +175,11 @@ impl LocalLlamaWorkerProvider {
 
 #[async_trait]
 impl WorkerProvider for LocalLlamaWorkerProvider {
-    async fn next_action(&self, state: &TaskState, capabilities: &AutomationCapabilities) -> Result<WorkerDecision> {
+    async fn next_action(
+        &self,
+        state: &TaskState,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<WorkerDecision> {
         self.client
             .parse_json(
                 "You are Jarvis Worker. Return strict JSON only.",
@@ -124,17 +193,59 @@ impl WorkerProvider for LocalLlamaWorkerProvider {
     }
 }
 
+#[derive(Clone)]
+pub struct HostedWorkerProvider {
+    client: OpenAiCompatibleClient,
+}
+
+impl HostedWorkerProvider {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
+        Self {
+            client: OpenAiCompatibleClient::new(base_url, model, api_key),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkerProvider for HostedWorkerProvider {
+    async fn next_action(
+        &self,
+        state: &TaskState,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<WorkerDecision> {
+        self.client
+            .parse_json(
+                "You are Jarvis Worker. Return strict JSON only.",
+                &build_worker_prompt(state, capabilities),
+            )
+            .await
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "hosted-openai-worker"
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct HeuristicPlannerProvider;
 
 #[async_trait]
 impl PlannerProvider for HeuristicPlannerProvider {
-    async fn create_plan(&self, task_input: &str, capabilities: &AutomationCapabilities) -> Result<TaskPlan> {
+    async fn create_plan(
+        &self,
+        task_input: &str,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<TaskPlan> {
         let lowered = task_input.to_ascii_lowercase();
 
-        if lowered.contains("schoology") || lowered.contains("biology assignment") || lowered.contains("assignment") {
+        if lowered.contains("schoology")
+            || lowered.contains("biology assignment")
+            || lowered.contains("assignment")
+        {
             return Ok(TaskPlan {
-                assistant_message: "I’m opening Chrome, getting into Schoology, and finding the assignment.".to_string(),
+                assistant_message:
+                    "I’m opening Chrome, getting into Schoology, and finding the assignment."
+                        .to_string(),
                 summary: "Open the latest Schoology assignment".to_string(),
                 goal: task_input.trim().to_string(),
                 success_criteria: vec![
@@ -143,18 +254,44 @@ impl PlannerProvider for HeuristicPlannerProvider {
                     "The assignment content is summarized before any submission".to_string(),
                 ],
                 steps: vec![
-                    step("activate_chrome", "Open Chrome", "Resolve and activate Google Chrome", "Chrome is frontmost"),
-                    step("open_schoology", "Open Schoology", "Open Schoology in Chrome", "Schoology is visible in Chrome"),
-                    step("open_assignments", "Open assignments", "Navigate to the assignments section", "The assignments view is visible"),
-                    step("open_biology", "Open biology assignment", "Open the latest biology-related assignment", "The biology assignment is open"),
-                    step("summarize_assignment", "Summarize assignment", "Read the assignment page and summarize the work", "The assignment details are summarized"),
+                    step(
+                        "activate_chrome",
+                        "Open Chrome",
+                        "Resolve and activate Google Chrome",
+                        "Chrome is frontmost",
+                    ),
+                    step(
+                        "open_schoology",
+                        "Open Schoology",
+                        "Open Schoology in Chrome",
+                        "Schoology is visible in Chrome",
+                    ),
+                    step(
+                        "open_assignments",
+                        "Open assignments",
+                        "Navigate to the assignments section",
+                        "The assignments view is visible",
+                    ),
+                    step(
+                        "open_biology",
+                        "Open biology assignment",
+                        "Open the latest biology-related assignment",
+                        "The biology assignment is open",
+                    ),
+                    step(
+                        "summarize_assignment",
+                        "Summarize assignment",
+                        "Read the assignment page and summarize the work",
+                        "The assignment details are summarized",
+                    ),
                 ],
             });
         }
 
         if lowered.contains("email") || lowered.contains("mail ") {
             let recipient = extract_after_keyword(task_input, "to");
-            let subject = extract_after_keyword(task_input, "about").unwrap_or_else(|| "Jarvis follow-up".to_string());
+            let subject = extract_after_keyword(task_input, "about")
+                .unwrap_or_else(|| "Jarvis follow-up".to_string());
             return Ok(TaskPlan {
                 assistant_message: "I’m preparing a Mail draft.".to_string(),
                 summary: "Compose an email draft".to_string(),
@@ -165,7 +302,12 @@ impl PlannerProvider for HeuristicPlannerProvider {
                     "Jarvis stops before sending".to_string(),
                 ],
                 steps: vec![
-                    step("activate_mail", "Open Mail", "Activate Mail", "Mail is frontmost"),
+                    step(
+                        "activate_mail",
+                        "Open Mail",
+                        "Activate Mail",
+                        "Mail is frontmost",
+                    ),
                     step(
                         "compose_mail",
                         "Compose mail",
@@ -190,22 +332,43 @@ impl PlannerProvider for HeuristicPlannerProvider {
                     "Jarvis stops before sending".to_string(),
                 ],
                 steps: vec![
-                    step("activate_messages", "Open Messages", "Activate Messages", "Messages is frontmost"),
-                    step("compose_message", "Compose message", "Create a draft message", "The message draft is prepared"),
+                    step(
+                        "activate_messages",
+                        "Open Messages",
+                        "Activate Messages",
+                        "Messages is frontmost",
+                    ),
+                    step(
+                        "compose_message",
+                        "Compose message",
+                        "Create a draft message",
+                        "The message draft is prepared",
+                    ),
                 ],
             });
         }
 
         if lowered.contains("open ") {
-            let app_name = extract_after_keyword(task_input, "open").unwrap_or_else(|| capabilities.primary_browser.clone());
+            let app_name = extract_after_keyword(task_input, "open")
+                .unwrap_or_else(|| capabilities.primary_browser.clone());
             return Ok(TaskPlan {
                 assistant_message: format!("I’m opening {}.", app_name),
                 summary: format!("Open {}", app_name),
                 goal: task_input.trim().to_string(),
                 success_criteria: vec![format!("{} is frontmost", app_name)],
                 steps: vec![
-                    step("resolve_app", "Resolve app", &format!("Resolve the requested app '{}'", app_name), "The requested app target is resolved"),
-                    step("activate_app", "Activate app", &format!("Activate the requested app '{}'", app_name), "The requested app is frontmost"),
+                    step(
+                        "resolve_app",
+                        "Resolve app",
+                        &format!("Resolve the requested app '{}'", app_name),
+                        "The requested app target is resolved",
+                    ),
+                    step(
+                        "activate_app",
+                        "Activate app",
+                        &format!("Activate the requested app '{}'", app_name),
+                        "The requested app is frontmost",
+                    ),
                 ],
             });
         }
@@ -215,21 +378,31 @@ impl PlannerProvider for HeuristicPlannerProvider {
                 assistant_message: "I’m opening Chrome for that search.".to_string(),
                 summary: "Open browser search".to_string(),
                 goal: task_input.trim().to_string(),
-                success_criteria: vec!["Chrome is open".to_string(), "The target page or search results are visible".to_string()],
+                success_criteria: vec![
+                    "Chrome is open".to_string(),
+                    "The target page or search results are visible".to_string(),
+                ],
                 steps: vec![
-                    step("activate_chrome", "Open Chrome", "Resolve and activate Chrome", "Chrome is frontmost"),
-                    step("browser_search", "Run search", "Open the relevant search or URL in Chrome", "The relevant page is visible"),
+                    step(
+                        "activate_chrome",
+                        "Open Chrome",
+                        "Resolve and activate Chrome",
+                        "Chrome is frontmost",
+                    ),
+                    step(
+                        "browser_search",
+                        "Run search",
+                        "Open the relevant search or URL in Chrome",
+                        "The relevant page is visible",
+                    ),
                 ],
             });
         }
 
-        Ok(TaskPlan {
-            assistant_message: format!("I understood '{}', but I need a more concrete desktop action.", task_input),
-            summary: "Clarify request".to_string(),
-            goal: task_input.trim().to_string(),
-            success_criteria: vec!["No desktop action required".to_string()],
-            steps: Vec::new(),
-        })
+        Err(anyhow!(
+            "heuristic planner has no deterministic workflow for request '{}'",
+            task_input.trim()
+        ))
     }
 
     fn provider_name(&self) -> &'static str {
@@ -242,7 +415,11 @@ pub struct HeuristicWorkerProvider;
 
 #[async_trait]
 impl WorkerProvider for HeuristicWorkerProvider {
-    async fn next_action(&self, state: &TaskState, _capabilities: &AutomationCapabilities) -> Result<WorkerDecision> {
+    async fn next_action(
+        &self,
+        state: &TaskState,
+        _capabilities: &AutomationCapabilities,
+    ) -> Result<WorkerDecision> {
         let Some(step) = state.current_step() else {
             return Ok(WorkerDecision {
                 assistant_message: Some("The plan has no remaining steps.".to_string()),
@@ -269,7 +446,11 @@ impl WorkerProvider for HeuristicWorkerProvider {
                     }
                 } else {
                     WorkerAction::Tool {
-                        request: tool("app_resolve", json!({ "app_name": app_name }), RiskLevel::Low),
+                        request: tool(
+                            "app_resolve",
+                            json!({ "app_name": app_name }),
+                            RiskLevel::Low,
+                        ),
                     }
                 }
             }
@@ -285,7 +466,11 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         reason: format!("{} did not become frontmost after activation", app_name),
                     }
                 } else {
-                    let mut request = tool("app_activate", json!({ "app_name": app_name }), RiskLevel::Low);
+                    let mut request = tool(
+                        "app_activate",
+                        json!({ "app_name": app_name }),
+                        RiskLevel::Low,
+                    );
                     request.expected_outcome = Some("requested app is frontmost".to_string());
                     WorkerAction::Tool { request }
                 }
@@ -300,17 +485,26 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         reason: "Chrome did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    let mut request = tool("app_activate", json!({ "app_name": "Google Chrome" }), RiskLevel::Low);
+                    let mut request = tool(
+                        "app_activate",
+                        json!({ "app_name": "Google Chrome" }),
+                        RiskLevel::Low,
+                    );
                     request.expected_outcome = Some("Google Chrome is frontmost".to_string());
                     WorkerAction::Tool { request }
                 }
             }
             "open_schoology" => {
-                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("browser_assert")
+                    && observation_proved(state)
+                {
                     WorkerAction::AdvanceStep {
                         note: "Schoology is open".to_string(),
                     }
-                } else if matches!(state.last_tool_name.as_deref(), Some("browser_open") | Some("chrome_open_tab")) {
+                } else if matches!(
+                    state.last_tool_name.as_deref(),
+                    Some("browser_open") | Some("chrome_open_tab")
+                ) {
                     let mut request = tool(
                         "browser_assert",
                         json!({ "url_contains": "schoology", "text_contains": "schoology" }),
@@ -329,11 +523,16 @@ impl WorkerProvider for HeuristicWorkerProvider {
                 }
             }
             "open_assignments" => {
-                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("browser_assert")
+                    && observation_proved(state)
+                {
                     WorkerAction::AdvanceStep {
                         note: "Opened the assignments view".to_string(),
                     }
-                } else if matches!(state.last_tool_name.as_deref(), Some("browser_click") | Some("chrome_click")) {
+                } else if matches!(
+                    state.last_tool_name.as_deref(),
+                    Some("browser_click") | Some("chrome_click")
+                ) {
                     let mut request = tool(
                         "browser_assert",
                         json!({ "url_contains": "assign", "text_contains": "assignment" }),
@@ -352,17 +551,23 @@ impl WorkerProvider for HeuristicWorkerProvider {
                 }
             }
             "open_biology" => {
-                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("browser_assert")
+                    && observation_proved(state)
+                {
                     WorkerAction::AdvanceStep {
                         note: "Opened the biology assignment".to_string(),
                     }
-                } else if matches!(state.last_tool_name.as_deref(), Some("browser_click") | Some("chrome_click")) {
+                } else if matches!(
+                    state.last_tool_name.as_deref(),
+                    Some("browser_click") | Some("chrome_click")
+                ) {
                     let mut request = tool(
                         "browser_assert",
                         json!({ "text_contains": "biology" }),
                         RiskLevel::Low,
                     );
-                    request.expected_outcome = Some("The biology assignment page is open".to_string());
+                    request.expected_outcome =
+                        Some("The biology assignment page is open".to_string());
                     WorkerAction::Tool { request }
                 } else {
                     let mut request = tool(
@@ -370,7 +575,8 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         json!({ "text": "biology" }),
                         RiskLevel::Medium,
                     );
-                    request.expected_outcome = Some("The latest biology assignment opens".to_string());
+                    request.expected_outcome =
+                        Some("The latest biology assignment opens".to_string());
                     WorkerAction::Tool { request }
                 }
             }
@@ -400,13 +606,19 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         reason: "Mail did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    let mut request = tool("app_activate", json!({ "app_name": "Mail" }), RiskLevel::Low);
+                    let mut request = tool(
+                        "app_activate",
+                        json!({ "app_name": "Mail" }),
+                        RiskLevel::Low,
+                    );
                     request.expected_outcome = Some("Mail is frontmost".to_string());
                     WorkerAction::Tool { request }
                 }
             }
             "compose_mail" => {
-                if state.last_tool_name.as_deref() == Some("mail_compose") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("mail_compose")
+                    && observation_proved(state)
+                {
                     WorkerAction::Complete {
                         message: "Mail draft prepared. I stopped before sending.".to_string(),
                     }
@@ -428,11 +640,11 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         risk: RiskLevel::Medium,
                         requires_confirmation: false,
                         target_identity: Some("com.apple.mail".to_string()),
-                        expected_outcome: Some("A visible Mail draft exists with the requested details".to_string()),
+                        expected_outcome: Some(
+                            "A visible Mail draft exists with the requested details".to_string(),
+                        ),
                     };
-                    WorkerAction::Tool {
-                        request,
-                    }
+                    WorkerAction::Tool { request }
                 }
             }
             "activate_messages" => {
@@ -445,13 +657,19 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         reason: "Messages did not become frontmost after activation".to_string(),
                     }
                 } else {
-                    let mut request = tool("app_activate", json!({ "app_name": "Messages" }), RiskLevel::Low);
+                    let mut request = tool(
+                        "app_activate",
+                        json!({ "app_name": "Messages" }),
+                        RiskLevel::Low,
+                    );
                     request.expected_outcome = Some("Messages is frontmost".to_string());
                     WorkerAction::Tool { request }
                 }
             }
             "compose_message" => {
-                if state.last_tool_name.as_deref() == Some("messages_compose") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("messages_compose")
+                    && observation_proved(state)
+                {
                     WorkerAction::Complete {
                         message: "Message draft prepared. I stopped before sending.".to_string(),
                     }
@@ -472,44 +690,50 @@ impl WorkerProvider for HeuristicWorkerProvider {
                         risk: RiskLevel::Medium,
                         requires_confirmation: false,
                         target_identity: Some("com.apple.MobileSMS".to_string()),
-                        expected_outcome: Some("A visible Messages draft exists for the requested recipient".to_string()),
+                        expected_outcome: Some(
+                            "A visible Messages draft exists for the requested recipient"
+                                .to_string(),
+                        ),
                     };
-                    WorkerAction::Tool {
-                        request,
-                    }
+                    WorkerAction::Tool { request }
                 }
             }
             "browser_search" => {
-                if state.last_tool_name.as_deref() == Some("browser_assert") && observation_proved(state) {
+                if state.last_tool_name.as_deref() == Some("browser_assert")
+                    && observation_proved(state)
+                {
                     WorkerAction::Complete {
                         message: "Opened the browser target.".to_string(),
                     }
-                } else if matches!(state.last_tool_name.as_deref(), Some("browser_open") | Some("chrome_open_tab")) {
+                } else if matches!(
+                    state.last_tool_name.as_deref(),
+                    Some("browser_open") | Some("chrome_open_tab")
+                ) {
                     let mut request = tool("browser_snapshot", json!({}), RiskLevel::Low);
                     request.expected_outcome = Some("The relevant page is visible".to_string());
                     WorkerAction::Tool { request }
                 } else if state.last_tool_name.as_deref() == Some("browser_snapshot") {
-                    WorkerAction::Complete {
-                        message: "Opened the browser target.".to_string(),
+                    WorkerAction::Replan {
+                        reason:
+                            "Browser snapshot observed a page, but nothing verified that it satisfied the request"
+                                .to_string(),
                     }
                 } else {
-                    let search_url = if let Some(url) = state
-                        .user_request
-                        .split_whitespace()
-                        .find(|token| token.starts_with("http://") || token.starts_with("https://"))
-                    {
-                        url.to_string()
-                    } else {
-                        format!(
-                            "https://www.google.com/search?q={}",
-                            state.user_request.replace(' ', "+")
-                        )
-                    };
-                    let mut request = tool("browser_open", json!({ "url": search_url }), RiskLevel::Low);
+                    let search_url =
+                        if let Some(url) = state.user_request.split_whitespace().find(|token| {
+                            token.starts_with("http://") || token.starts_with("https://")
+                        }) {
+                            url.to_string()
+                        } else {
+                            format!(
+                                "https://www.google.com/search?q={}",
+                                state.user_request.replace(' ', "+")
+                            )
+                        };
+                    let mut request =
+                        tool("browser_open", json!({ "url": search_url }), RiskLevel::Low);
                     request.expected_outcome = Some("The browser target is visible".to_string());
-                    WorkerAction::Tool {
-                        request,
-                    }
+                    WorkerAction::Tool { request }
                 }
             }
             _ => {
@@ -568,30 +792,30 @@ fn observation_proved(state: &TaskState) -> bool {
 }
 
 pub struct PlannerStack {
-    primary: Arc<dyn PlannerProvider>,
-    fallback: Arc<dyn PlannerProvider>,
+    providers: Vec<Arc<dyn PlannerProvider>>,
 }
 
 impl PlannerStack {
-    pub fn new(primary: Arc<dyn PlannerProvider>, fallback: Arc<dyn PlannerProvider>) -> Self {
-        Self { primary, fallback }
+    pub fn new(providers: Vec<Arc<dyn PlannerProvider>>) -> Self {
+        Self { providers }
     }
 }
 
 #[async_trait]
 impl PlannerProvider for PlannerStack {
-    async fn create_plan(&self, task_input: &str, capabilities: &AutomationCapabilities) -> Result<TaskPlan> {
-        match self.primary.create_plan(task_input, capabilities).await {
-            Ok(plan) => Ok(plan),
-            Err(primary_error) => match self.fallback.create_plan(task_input, capabilities).await {
-                Ok(plan) => Ok(plan),
-                Err(fallback_error) => bail!(
-                    "planner failed with primary={} fallback={}",
-                    primary_error,
-                    fallback_error
-                ),
-            },
+    async fn create_plan(
+        &self,
+        task_input: &str,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<TaskPlan> {
+        let mut errors = Vec::new();
+        for provider in &self.providers {
+            match provider.create_plan(task_input, capabilities).await {
+                Ok(plan) => return Ok(plan),
+                Err(error) => errors.push(format!("{}={}", provider.provider_name(), error)),
+            }
         }
+        bail!("planner failed across providers: {}", errors.join(" | "))
     }
 
     fn provider_name(&self) -> &'static str {
@@ -600,30 +824,30 @@ impl PlannerProvider for PlannerStack {
 }
 
 pub struct WorkerStack {
-    primary: Arc<dyn WorkerProvider>,
-    fallback: Arc<dyn WorkerProvider>,
+    providers: Vec<Arc<dyn WorkerProvider>>,
 }
 
 impl WorkerStack {
-    pub fn new(primary: Arc<dyn WorkerProvider>, fallback: Arc<dyn WorkerProvider>) -> Self {
-        Self { primary, fallback }
+    pub fn new(providers: Vec<Arc<dyn WorkerProvider>>) -> Self {
+        Self { providers }
     }
 }
 
 #[async_trait]
 impl WorkerProvider for WorkerStack {
-    async fn next_action(&self, state: &TaskState, capabilities: &AutomationCapabilities) -> Result<WorkerDecision> {
-        match self.primary.next_action(state, capabilities).await {
-            Ok(decision) => Ok(decision),
-            Err(primary_error) => match self.fallback.next_action(state, capabilities).await {
-                Ok(decision) => Ok(decision),
-                Err(fallback_error) => bail!(
-                    "worker failed with primary={} fallback={}",
-                    primary_error,
-                    fallback_error
-                ),
-            },
+    async fn next_action(
+        &self,
+        state: &TaskState,
+        capabilities: &AutomationCapabilities,
+    ) -> Result<WorkerDecision> {
+        let mut errors = Vec::new();
+        for provider in &self.providers {
+            match provider.next_action(state, capabilities).await {
+                Ok(decision) => return Ok(decision),
+                Err(error) => errors.push(format!("{}={}", provider.provider_name(), error)),
+            }
         }
+        bail!("worker failed across providers: {}", errors.join(" | "))
     }
 
     fn provider_name(&self) -> &'static str {
@@ -738,13 +962,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heuristic_planner_errors_on_unknown_requests() {
+        let provider = HeuristicPlannerProvider;
+        let result = provider
+            .create_plan("coordinate a vague autonomous workflow", &caps())
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn compose_mail_requires_verified_draft_before_completion() {
         let worker = HeuristicWorkerProvider;
         let plan = HeuristicPlannerProvider
             .create_plan("send an email to teacher about missing homework", &caps())
             .await
             .unwrap();
-        let mut state = TaskState::new("send an email to teacher about missing homework".to_string(), plan);
+        let mut state = TaskState::new(
+            "send an email to teacher about missing homework".to_string(),
+            plan,
+        );
         state.active_step_index = 1;
         state.last_tool_name = Some("mail_compose".to_string());
         state.last_observation = Some(crate::llm::schema::Observation {

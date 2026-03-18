@@ -1,5 +1,9 @@
 /target
 .tooling/
+.venv/
+__pycache__/
+artifacts/
+scenario_artifacts/
 *.wav
 transcript.txt
 browser_sidecar/node_modules/

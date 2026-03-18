@@ -4,16 +4,22 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::agent_core::{
+    evidence_from_observation, verify_plan_completion, ActionSpec, RecoveryDecision, RecoveryKind,
+    TaskJournalEntry,
+};
 use crate::automation::{
     AppTarget, AutomationBackend, BrowserTarget, RiskLevel, ToolCallRequest, ToolCallResult,
 };
 use crate::config::AppConfig;
 use crate::llm::{
-    CompletionStatus, HeuristicPlannerProvider, HeuristicWorkerProvider, LocalLlamaPlannerProvider,
-    LocalLlamaWorkerProvider, Observation, PlannerProvider, PlannerStack, TaskPlan, TaskState,
-    WorkerAction, WorkerProvider, WorkerStack,
+    CompletionStatus, HeuristicPlannerProvider, HeuristicWorkerProvider, HostedPlannerProvider,
+    HostedWorkerProvider, LocalLlamaPlannerProvider, LocalLlamaWorkerProvider, Observation,
+    PlannerProvider, PlannerStack, TaskPlan, TaskState, WorkerAction, WorkerProvider, WorkerStack,
 };
-use crate::sms::{start_approval_webhook, NoopSmsService, SmsApprovalAction, SmsService, TwilioSmsService};
+use crate::sms::{
+    start_approval_webhook, NoopSmsService, SmsApprovalAction, SmsService, TwilioSmsService,
+};
 use crate::speech::{MacOsSayTextToSpeech, SpeechToText, TextToSpeech, WhisperCommandSpeechToText};
 
 #[derive(Debug, Clone)]
@@ -287,7 +293,9 @@ impl AgentRuntime {
             }
             AgentCommand::StartListening => {
                 self.emit(AgentEvent::Listening(true));
-                self.emit(AgentEvent::Status("Listening for voice input...".to_string()));
+                self.emit(AgentEvent::Status(
+                    "Listening for voice input...".to_string(),
+                ));
                 match self
                     .stt
                     .record_and_transcribe(&self.config.recording_path, self.config.capture_seconds)
@@ -302,7 +310,10 @@ impl AgentRuntime {
                     }
                     Err(error) => {
                         self.emit(AgentEvent::Listening(false));
-                        self.emit(AgentEvent::Error(format!("Voice capture failed: {}", error)));
+                        self.emit(AgentEvent::Error(format!(
+                            "Voice capture failed: {}",
+                            error
+                        )));
                     }
                 }
             }
@@ -374,9 +385,18 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        self.notify_sms(&format!("Jarvis started: {}", plan.summary)).await;
+        self.notify_sms(&format!("Jarvis started: {}", plan.summary))
+            .await;
 
-        let state = TaskState::new(input, plan);
+        let mut state = TaskState::new(input, plan);
+        state.journal.push(TaskJournalEntry {
+            phase: "plan".to_string(),
+            message: format!("Started task '{}'", state.plan.summary),
+            action: None,
+            evidence: None,
+            verification: None,
+            recovery: None,
+        });
         self.execute_task_loop(state).await
     }
 
@@ -408,6 +428,18 @@ impl AgentRuntime {
                         "Next tool: {} ({:?})",
                         request.name, risk
                     )));
+                    state.journal.push(TaskJournalEntry {
+                        phase: "action".to_string(),
+                        message: format!("Scheduling tool {}", request.name),
+                        action: Some(ActionSpec {
+                            name: request.name.clone(),
+                            expected_outcome: request.expected_outcome.clone(),
+                            target_identity: request.target_identity.clone(),
+                        }),
+                        evidence: None,
+                        verification: None,
+                        recovery: None,
+                    });
                     if requires_user_approval(&request, risk) {
                         let message = format!(
                             "Approval required before {}. Approve in the app or reply YES by SMS.",
@@ -416,13 +448,11 @@ impl AgentRuntime {
                         state.awaiting_approval = true;
                         state.completion_status = CompletionStatus::AwaitingApproval;
                         state.block_current_step();
-                        self.pending = Some(PendingApproval {
-                            state,
-                            request,
-                        });
+                        self.pending = Some(PendingApproval { state, request });
                         self.emit(AgentEvent::ApprovalRequired(message.clone()));
                         self.notify_sms(&message).await;
-                        self.say("I need approval before the next irreversible step.").await;
+                        self.say("I need approval before the next irreversible step.")
+                            .await;
                         return Ok(());
                     }
 
@@ -440,8 +470,13 @@ impl AgentRuntime {
                     state.advance_step();
                     if state.current_step().is_none() {
                         let message = format!("Task completed: {}", state.plan.summary);
-                        self.complete_task(&message).await;
-                        return Ok(());
+                        match self.attempt_completion(state, message).await? {
+                            Some(next_state) => {
+                                state = next_state;
+                                continue;
+                            }
+                            None => return Ok(()),
+                        }
                     }
                 }
                 WorkerAction::Replan { reason } => {
@@ -458,6 +493,18 @@ impl AgentRuntime {
                         )
                         .await?;
                     self.emit(AgentEvent::TaskUpdated(replanned.summary.clone()));
+                    state.journal.push(TaskJournalEntry {
+                        phase: "recovery".to_string(),
+                        message: format!("Replanning because {}", reason),
+                        action: None,
+                        evidence: None,
+                        verification: None,
+                        recovery: Some(RecoveryDecision {
+                            kind: RecoveryKind::Replan,
+                            reason,
+                            next_hint: Some(replanned.summary.clone()),
+                        }),
+                    });
                     state.reset_for_replan(replanned);
                 }
                 WorkerAction::Complete { message } => {
@@ -468,8 +515,10 @@ impl AgentRuntime {
                         ));
                         continue;
                     }
-                    self.complete_task(&message).await;
-                    return Ok(());
+                    match self.attempt_completion(state, message).await? {
+                        Some(next_state) => state = next_state,
+                        None => return Ok(()),
+                    }
                 }
             }
         }
@@ -481,15 +530,26 @@ impl AgentRuntime {
         )
     }
 
-    async fn execute_tool(&mut self, request: &ToolCallRequest, mut state: TaskState) -> Result<TaskState> {
+    async fn execute_tool(
+        &mut self,
+        request: &ToolCallRequest,
+        mut state: TaskState,
+    ) -> Result<TaskState> {
         self.emit(AgentEvent::ToolLog(format!(
             "Running tool {}",
             request.name
         )));
         state.last_expected_outcome = request.expected_outcome.clone();
-        let result = self.automation.call_tool(request.clone()).await.with_context(|| {
-            format!("tool {} failed while executing '{}'", request.name, state.plan.summary)
-        })?;
+        let result = self
+            .automation
+            .call_tool(request.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "tool {} failed while executing '{}'",
+                    request.name, state.plan.summary
+                )
+            })?;
         self.handle_tool_result(&result, &mut state).await;
         Ok(state)
     }
@@ -517,14 +577,86 @@ impl AgentRuntime {
             proof_passed: result.proof_passed,
             observed_outcome: result.observed_outcome.clone(),
         });
+        if let Some(observation) = state.last_observation.as_ref() {
+            state.journal.push(TaskJournalEntry {
+                phase: "observe".to_string(),
+                message: result.summary.clone(),
+                action: None,
+                evidence: Some(evidence_from_observation(observation)),
+                verification: None,
+                recovery: None,
+            });
+        }
         self.emit(AgentEvent::ObservationUpdated(result.summary.clone()));
 
         if let Ok(app_target) = serde_json::from_value::<AppTarget>(result.observation.clone()) {
             state.active_app = Some(app_target);
         }
-        if let Ok(browser_target) = serde_json::from_value::<BrowserTarget>(result.observation.clone()) {
+        if let Ok(browser_target) =
+            serde_json::from_value::<BrowserTarget>(result.observation.clone())
+        {
             state.active_browser = Some(browser_target);
         }
+    }
+
+    async fn attempt_completion(
+        &mut self,
+        mut state: TaskState,
+        message: String,
+    ) -> Result<Option<TaskState>> {
+        let verification = verify_plan_completion(&state.plan, state.last_observation.as_ref());
+        state.final_verification = Some(verification.clone());
+        state.journal.final_verification = Some(verification.clone());
+        state.journal.push(TaskJournalEntry {
+            phase: "verify".to_string(),
+            message: verification.summary.clone(),
+            action: None,
+            evidence: state
+                .last_observation
+                .as_ref()
+                .map(evidence_from_observation),
+            verification: Some(verification.clone()),
+            recovery: None,
+        });
+
+        if verification.satisfied {
+            self.complete_task(&message).await;
+            return Ok(None);
+        }
+
+        self.emit(AgentEvent::Status(format!(
+            "Final verifier requested recovery: {}",
+            verification.summary
+        )));
+        let capabilities = self.automation.capabilities();
+        let replanned = self
+            .planner
+            .create_plan(
+                &format!(
+                    "Original request: {}\nFinal verifier summary: {}\nMissing criteria: {:?}\nLast observation: {:?}",
+                    state.user_request,
+                    verification.summary,
+                    verification.missing_criteria,
+                    state.last_observation
+                ),
+                &capabilities,
+            )
+            .await?;
+        state.journal.push(TaskJournalEntry {
+            phase: "recovery".to_string(),
+            message: "Final verifier triggered a recovery replan".to_string(),
+            action: None,
+            evidence: None,
+            verification: Some(verification),
+            recovery: Some(RecoveryDecision {
+                kind: RecoveryKind::Replan,
+                reason: "Final verifier could not confirm completion".to_string(),
+                next_hint: Some(replanned.summary.clone()),
+            }),
+        });
+        self.emit(AgentEvent::TaskUpdated(replanned.summary.clone()));
+        state.reset_for_replan(replanned);
+        Ok(Some(state))
     }
 
     async fn complete_task(&self, message: &str) {
@@ -556,23 +688,45 @@ impl AgentRuntime {
 }
 
 fn build_planner_stack(config: &AppConfig) -> Arc<dyn PlannerProvider> {
-    let primary = Arc::new(HeuristicPlannerProvider) as Arc<dyn PlannerProvider>;
-    let fallback = Arc::new(LocalLlamaPlannerProvider::new(
+    let mut providers = Vec::<Arc<dyn PlannerProvider>>::new();
+    if let (Some(base_url), Some(model)) = (
+        config.provider.fallback_base_url.clone(),
+        config.provider.fallback_model.clone(),
+    ) {
+        providers.push(Arc::new(HostedPlannerProvider::new(
+            base_url,
+            model,
+            config.provider.fallback_api_key.clone(),
+        )));
+    }
+    providers.push(Arc::new(LocalLlamaPlannerProvider::new(
         config.provider.planner_endpoint.clone(),
         config.provider.planner_model.clone(),
         config.provider.fallback_api_key.clone(),
-    )) as Arc<dyn PlannerProvider>;
-    Arc::new(PlannerStack::new(primary, fallback))
+    )));
+    providers.push(Arc::new(HeuristicPlannerProvider));
+    Arc::new(PlannerStack::new(providers))
 }
 
 fn build_worker_stack(config: &AppConfig) -> Arc<dyn WorkerProvider> {
-    let primary = Arc::new(HeuristicWorkerProvider) as Arc<dyn WorkerProvider>;
-    let fallback = Arc::new(LocalLlamaWorkerProvider::new(
+    let mut providers = Vec::<Arc<dyn WorkerProvider>>::new();
+    if let (Some(base_url), Some(model)) = (
+        config.provider.fallback_base_url.clone(),
+        config.provider.fallback_model.clone(),
+    ) {
+        providers.push(Arc::new(HostedWorkerProvider::new(
+            base_url,
+            model,
+            config.provider.fallback_api_key.clone(),
+        )));
+    }
+    providers.push(Arc::new(LocalLlamaWorkerProvider::new(
         config.provider.worker_endpoint.clone(),
         config.provider.worker_model.clone(),
         config.provider.fallback_api_key.clone(),
-    )) as Arc<dyn WorkerProvider>;
-    Arc::new(WorkerStack::new(primary, fallback))
+    )));
+    providers.push(Arc::new(HeuristicWorkerProvider));
+    Arc::new(WorkerStack::new(providers))
 }
 
 fn build_tts(config: &AppConfig) -> Arc<dyn TextToSpeech> {
@@ -640,10 +794,8 @@ fn requires_user_approval(request: &ToolCallRequest, risk: RiskLevel) -> bool {
         return true;
     }
 
-    matches!(
-        request.name.as_str(),
-        "filesystem_delete" | "shell_run"
-    ) || matches!(risk, RiskLevel::Critical)
+    matches!(request.name.as_str(), "filesystem_delete" | "shell_run")
+        || matches!(risk, RiskLevel::Critical)
 }
 
 fn step_proved(state: &TaskState) -> bool {

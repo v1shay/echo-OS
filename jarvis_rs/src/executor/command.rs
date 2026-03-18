@@ -1,10 +1,9 @@
+use crate::intent::validator::ValidatedParams;
 use anyhow::Result;
 use std::process::Command;
-use crate::intent::validator::ValidatedParams;
 
 pub fn execute(intent: ValidatedParams) -> Result<()> {
     match intent {
-
         ValidatedParams::OpenApplication(params) => {
             println!("Opening application: {}", params.app_name);
 
@@ -17,13 +16,14 @@ pub fn execute(intent: ValidatedParams) -> Result<()> {
         ValidatedParams::ListFiles(params) => {
             println!("Listing files in: {}", params.directory);
 
-            Command::new("ls")
-                .arg(params.directory)
-                .spawn()?;
+            Command::new("ls").arg(params.directory).spawn()?;
         }
 
         ValidatedParams::CreateFolder(params) => {
-            println!("Creating folder: {}/{}", params.directory, params.folder_name);
+            println!(
+                "Creating folder: {}/{}",
+                params.directory, params.folder_name
+            );
 
             Command::new("mkdir")
                 .arg(format!("{}/{}", params.directory, params.folder_name))
@@ -33,9 +33,7 @@ pub fn execute(intent: ValidatedParams) -> Result<()> {
         ValidatedParams::DeleteFile(params) => {
             println!("Deleting file: {}", params.path);
 
-            Command::new("rm")
-                .arg(params.path)
-                .spawn()?;
+            Command::new("rm").arg(params.path).spawn()?;
         }
 
         ValidatedParams::SearchWeb(params) => {
@@ -43,9 +41,7 @@ pub fn execute(intent: ValidatedParams) -> Result<()> {
 
             let url = format!("https://www.google.com/search?q={}", params.query);
 
-            Command::new("open")
-                .arg(url)
-                .spawn()?;
+            Command::new("open").arg(url).spawn()?;
         }
     }
 

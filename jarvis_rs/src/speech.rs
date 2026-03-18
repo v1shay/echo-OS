@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::io::ErrorKind;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -136,7 +136,10 @@ pub fn record_wav(path: &Path, seconds: u64) -> Result<()> {
     Ok(())
 }
 
-fn write_samples_f32(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>, data: &[f32]) {
+fn write_samples_f32(
+    writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    data: &[f32],
+) {
     if let Ok(mut writer) = writer.lock() {
         if let Some(writer) = writer.as_mut() {
             for sample in data {
@@ -147,7 +150,10 @@ fn write_samples_f32(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWrit
     }
 }
 
-fn write_samples_i16(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>, data: &[i16]) {
+fn write_samples_i16(
+    writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    data: &[i16],
+) {
     if let Ok(mut writer) = writer.lock() {
         if let Some(writer) = writer.as_mut() {
             for sample in data {
@@ -157,7 +163,10 @@ fn write_samples_i16(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWrit
     }
 }
 
-fn write_samples_u16(writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>, data: &[u16]) {
+fn write_samples_u16(
+    writer: &Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    data: &[u16],
+) {
     if let Ok(mut writer) = writer.lock() {
         if let Some(writer) = writer.as_mut() {
             for sample in data {
@@ -213,8 +222,8 @@ mod tests {
 
     #[test]
     fn whisper_cli_transcript_path_round_trip() {
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../.tooling/models/ggml-tiny.en.bin");
+        let model_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.tooling/models/ggml-tiny.en.bin");
         let fixture_wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../input.wav");
         let temp_wav = std::env::temp_dir().join(format!(
             "jarvis-speech-test-{}.wav",

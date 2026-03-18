@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
@@ -66,6 +67,10 @@ impl Default for AppConfig {
         let browser_sidecar_dir = project_root.join("browser_sidecar");
         let browser_port = 4317;
         let chrome_debug_port = 9222;
+        let node_binary =
+            detect_binary_path("node").unwrap_or_else(|| local_node_root.join("bin/node"));
+        let npm_binary =
+            detect_binary_path("npm").unwrap_or_else(|| local_node_root.join("bin/npm"));
 
         let mut allowed_paths = vec![current_dir.clone()];
         allowed_paths.push(home_dir.join("Desktop"));
@@ -106,8 +111,8 @@ impl Default for AppConfig {
                 sidecar_port: browser_port,
                 sidecar_dir: browser_sidecar_dir.clone(),
                 sidecar_entry: browser_sidecar_dir.join("server.mjs"),
-                node_binary: local_node_root.join("bin/node"),
-                npm_binary: local_node_root.join("bin/npm"),
+                node_binary,
+                npm_binary,
                 chrome_executable: PathBuf::from(
                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                 ),
@@ -321,6 +326,19 @@ fn project_root_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn detect_binary_path(name: &str) -> Option<PathBuf> {
+    let output = Command::new("which").arg(name).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
 fn auto_detect_whisper_model() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -329,8 +347,12 @@ fn auto_detect_whisper_model() -> Option<PathBuf> {
         candidates.push(root.join(".tooling/models/ggml-base.en.bin"));
     }
 
-    candidates.push(PathBuf::from("/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin"));
-    candidates.push(PathBuf::from("/usr/local/share/whisper-cpp/for-tests-ggml-tiny.bin"));
+    candidates.push(PathBuf::from(
+        "/opt/homebrew/share/whisper-cpp/for-tests-ggml-tiny.bin",
+    ));
+    candidates.push(PathBuf::from(
+        "/usr/local/share/whisper-cpp/for-tests-ggml-tiny.bin",
+    ));
 
     candidates.into_iter().find(|path| path.exists())
 }
