@@ -1989,6 +1989,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "cpal",
  "dotenvy",
  "eframe",

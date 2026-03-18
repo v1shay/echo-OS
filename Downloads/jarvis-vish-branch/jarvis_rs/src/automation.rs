@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -121,6 +122,8 @@ pub struct MacAutomationBackend {
     app_aliases: HashMap<String, String>,
     primary_browser: String,
     browser_sidecar: BrowserSidecarManager,
+    http_client: reqwest::Client,
+    vision_api_key: Option<String>,
 }
 
 pub type LocalAutomationBackend = MacAutomationBackend;
@@ -138,6 +141,8 @@ impl MacAutomationBackend {
             app_aliases: default_app_aliases(),
             primary_browser: config.primary_browser.clone(),
             browser_sidecar: BrowserSidecarManager::new(config.browser.clone()),
+            http_client: reqwest::Client::new(),
+            vision_api_key: config.provider.fallback_api_key.clone(),
         }
     }
 
@@ -174,6 +179,9 @@ impl MacAutomationBackend {
             "browser_snapshot",
             "browser_extract_text",
             "browser_assert",
+            "speak",
+            "media_control",
+            "screen_click",
             "mail_compose",
             "messages_compose",
             "filesystem_list",
@@ -233,6 +241,87 @@ impl MacAutomationBackend {
             proof_passed: true,
             observed_outcome: None,
         }
+    }
+
+    async fn screen_find_and_click(&self, label: &str) -> Result<()> {
+        let api_key = self.vision_api_key.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("JARVIS_FALLBACK_API_KEY not set — needed for screen_click"))?;
+
+        // 1. Take screenshot
+        let path = std::env::temp_dir().join("jarvis-vision.png");
+        let status = Command::new("screencapture")
+            .arg("-x").arg("-t").arg("png").arg(&path)
+            .status().context("screencapture failed")?;
+        if !status.success() {
+            bail!("screencapture exited with error");
+        }
+
+        // 2. Base64 encode
+        let bytes = fs::read(&path).context("failed to read screenshot")?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        // 3. Get logical screen size via AppleScript
+        let dims = self.run_applescript_lines(&[
+            r#"tell application "Finder""#.to_string(),
+            r#"set b to bounds of window of desktop"#.to_string(),
+            r#"return ((item 3 of b) as string) & "," & ((item 4 of b) as string)"#.to_string(),
+            "end tell".to_string(),
+        ]).unwrap_or_else(|_| "1920,1080".to_string());
+        let mut parts = dims.trim().splitn(2, ',');
+        let sw: f64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1920.0);
+        let sh: f64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1080.0);
+
+        // 4. Ask GPT-4o-mini vision for element coordinates (as 0-1 fractions)
+        let resp: serde_json::Value = self.http_client
+            .post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": "gpt-4o-mini",
+                "max_tokens": 60,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/png;base64,{}", b64),
+                                "detail": "high"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": format!(
+                                "This is a macOS screenshot. Find the UI element matching '{}'. Return ONLY valid JSON with no markdown: {{\"x\": <0.0-1.0 fraction from left edge>, \"y\": <0.0-1.0 fraction from top edge>}} for the exact center of that element. If multiple matches exist, pick the most prominent one.",
+                                label
+                            )
+                        }
+                    ]
+                }]
+            }))
+            .send().await?.error_for_status()?.json().await?;
+
+        let raw = resp["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+        let json_str = raw
+            .strip_prefix("```json").or_else(|| raw.strip_prefix("```"))
+            .and_then(|s| s.rsplit_once("```").map(|(inner, _)| inner.trim()))
+            .unwrap_or(&raw);
+
+        let coords: serde_json::Value = serde_json::from_str(json_str)
+            .with_context(|| format!("vision model returned: {}", raw))?;
+
+        let fx = coords["x"].as_f64().context("no x coordinate in vision response")?;
+        let fy = coords["y"].as_f64().context("no y coordinate in vision response")?;
+        let cx = (fx * sw) as i64;
+        let cy = (fy * sh) as i64;
+
+        // 5. Click at coordinates
+        self.run_applescript_lines(&[
+            r#"tell application "System Events""#.to_string(),
+            format!("click at {{{}, {}}}", cx, cy),
+            "end tell".to_string(),
+        ])?;
+
+        Ok(())
     }
 
     fn resolve_app_target(&self, app_name: &str) -> Result<AppTarget> {
@@ -541,6 +630,11 @@ impl MacAutomationBackend {
 #[derive(Debug, Deserialize)]
 struct AppResolveArgs {
     app_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScreenClickArgs {
+    label: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -900,6 +994,50 @@ impl AutomationBackend for MacAutomationBackend {
                     observed_outcome: Some(args.path),
                 })
             }
+            "speak" => {
+                let message = request.arguments["message"].as_str().unwrap_or("").to_string();
+                Ok(Self::summary(
+                    "speak",
+                    message.clone(),
+                    Some(message),
+                    json!({"spoken": true}),
+                ))
+            }
+            "media_control" => {
+                // Native AppleScript control for Spotify / Music / system media
+                let action = request.arguments["action"].as_str().unwrap_or("play").to_string();
+                let app = request.arguments["app"].as_str().unwrap_or("Spotify").to_string();
+                let script_action = match action.to_lowercase().as_str() {
+                    "pause" | "stop" => "pause",
+                    "next" | "next_track" => "next track",
+                    "previous" | "prev" | "previous_track" => "previous track",
+                    _ => "play", // play / resume / toggle all map to "play"
+                };
+                let result = self.run_applescript_lines(&[
+                    format!("tell application \"{}\"", app),
+                    script_action.to_string(),
+                    "end tell".to_string(),
+                ]);
+                match result {
+                    Ok(_) => Ok(Self::summary(
+                        "media_control",
+                        format!("{} {}", script_action, app),
+                        Some(format!("Sent '{}' command to {}", script_action, app)),
+                        json!({"action": script_action, "app": app}),
+                    )),
+                    Err(e) => bail!("media_control failed: {}", e),
+                }
+            }
+            "screen_click" => {
+                let args: ScreenClickArgs = serde_json::from_value(request.arguments)?;
+                self.screen_find_and_click(&args.label).await?;
+                Ok(Self::summary(
+                    "screen_click",
+                    format!("Clicked '{}'", args.label),
+                    Some(format!("Found and clicked '{}'", args.label)),
+                    json!({"label": args.label}),
+                ))
+            }
             "mail_compose" => {
                 let args: MailComposeArgs = serde_json::from_value(request.arguments)?;
                 let recipient_line = args
@@ -1145,6 +1283,8 @@ impl AutomationBackend for MacAutomationBackend {
             }
             "ui_click" | "ui_type" | "ui_press_key" | "ui_select_menu" | "ui_scroll" => RiskLevel::High,
             "chrome_eval" | "chrome_click" | "chrome_type" | "browser_click" | "browser_fill" => RiskLevel::Medium,
+            "media_control" => RiskLevel::Low,
+            "screen_click" => RiskLevel::Medium,
             "messages_compose" | "mail_compose" => RiskLevel::Medium,
             _ => request.risk,
         }
@@ -1195,6 +1335,18 @@ fn default_app_aliases() -> HashMap<String, String> {
         ("safari".to_string(), "com.apple.Safari".to_string()),
         ("finder".to_string(), "com.apple.finder".to_string()),
         ("notes".to_string(), "com.apple.Notes".to_string()),
+        ("zoom".to_string(), "us.zoom.xos".to_string()),
+        ("zoom app".to_string(), "us.zoom.xos".to_string()),
+        ("zoom application".to_string(), "us.zoom.xos".to_string()),
+        ("zoom us".to_string(), "us.zoom.xos".to_string()),
+        ("spotify".to_string(), "com.spotify.client".to_string()),
+        ("slack".to_string(), "com.tinyspeck.slackmacgap".to_string()),
+        ("discord".to_string(), "com.hnc.Discord".to_string()),
+        ("vscode".to_string(), "com.microsoft.VSCode".to_string()),
+        ("vs code".to_string(), "com.microsoft.VSCode".to_string()),
+        ("visual studio code".to_string(), "com.microsoft.VSCode".to_string()),
+        ("terminal".to_string(), "com.apple.Terminal".to_string()),
+        ("xcode".to_string(), "com.apple.dt.Xcode".to_string()),
     ])
 }
 
@@ -1217,6 +1369,13 @@ fn canonical_display_name(bundle_id: &str) -> String {
         "com.apple.Safari" => "Safari",
         "com.apple.finder" => "Finder",
         "com.apple.Notes" => "Notes",
+        "com.apple.Terminal" => "Terminal",
+        "com.apple.dt.Xcode" => "Xcode",
+        "us.zoom.xos" => "zoom.us",
+        "com.spotify.client" => "Spotify",
+        "com.tinyspeck.slackmacgap" => "Slack",
+        "com.hnc.Discord" => "Discord",
+        "com.microsoft.VSCode" => "Visual Studio Code",
         _ => bundle_id,
     }
     .to_string()

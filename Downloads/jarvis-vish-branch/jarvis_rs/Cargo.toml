@@ -32,3 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # Env file loading
 dotenvy = "0.15"
+
+# Base64 encoding for vision screenshots
+base64 = "0.22"
