@@ -1104,46 +1104,50 @@ impl AutomationBackend for MacAutomationBackend {
                 let recipient = args
                     .recipient
                     .ok_or_else(|| anyhow!("messages_compose requires a recipient"))?;
-                self.run_applescript_lines(&vec![format!(
-                    r#"open location "sms:{}&body={}""#,
+
+                // Activate Messages first, then open the sms: URL to pre-fill recipient + body
+                self.run_applescript_lines(&[
+                    r#"tell application "Messages" to activate"#.to_string(),
+                ])?;
+                thread::sleep(Duration::from_millis(400));
+
+                let url = format!(
+                    "sms:{}&body={}",
                     percent_encode_for_url(&recipient),
                     percent_encode_for_url(&args.body)
-                )])?;
-                thread::sleep(Duration::from_millis(800));
-                let frontmost = self.frontmost_app_name().unwrap_or_default();
-                let output = self.run_applescript_lines(&vec![
-                    r#"tell application id "com.apple.MobileSMS""#.to_string(),
-                    "set windowCount to count of windows".to_string(),
-                    "set frontWindowName to name of front window".to_string(),
-                    "return (windowCount as string) & linefeed & frontWindowName".to_string(),
-                    "end tell".to_string(),
+                );
+                // Use do shell script to open the URL — more reliable than AppleScript open location
+                self.run_applescript_lines(&[
+                    format!(r#"do shell script "open '{}'"#, url.replace('\'', "%27")),
                 ])?;
-                let mut lines = output.lines();
-                let window_count = lines
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or_default();
-                let window_name = lines.next().unwrap_or_default().to_string();
+                thread::sleep(Duration::from_millis(800));
+
+                let frontmost = self.frontmost_app_name().unwrap_or_default();
+                let window_count = self.run_applescript_lines(&[
+                    r#"tell application id "com.apple.MobileSMS""#.to_string(),
+                    "return (count of windows) as string".to_string(),
+                    "end tell".to_string(),
+                ]).ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
+
                 let proof_passed = frontmost == "Messages" && window_count > 0;
                 let mut result = Self::summary(
                     "messages_compose",
                     if proof_passed {
-                        format!("Prepared Messages draft for {} (verified window)", recipient)
+                        format!("Opened Messages compose for {} (verified)", recipient)
                     } else {
-                        format!("Prepared Messages draft for {} (verification incomplete)", recipient)
+                        format!("Opened Messages for {} (verification incomplete)", recipient)
                     },
                     Some(args.body.clone()),
                     json!({
                         "recipient": recipient,
                         "body": args.body,
                         "window_count": window_count,
-                        "window_name": window_name,
                         "frontmost_app": frontmost,
                     }),
                 );
                 result.target_identity = Some("com.apple.MobileSMS".to_string());
                 result.proof_passed = proof_passed;
-                result.observed_outcome = Some(window_name);
+                result.observed_outcome = Some(format!("Messages open with {} windows", window_count));
                 Ok(result)
             }
             "filesystem_list" => {
