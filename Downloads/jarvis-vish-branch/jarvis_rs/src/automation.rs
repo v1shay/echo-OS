@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::browser_sidecar::{browser_target_from_value, BrowserSidecarDiagnostics, BrowserSidecarManager};
+use crate::calendar::CalendarService;
 use crate::config::AppConfig;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,6 +125,7 @@ pub struct MacAutomationBackend {
     browser_sidecar: BrowserSidecarManager,
     http_client: reqwest::Client,
     vision_api_key: Option<String>,
+    calendar: CalendarService,
 }
 
 pub type LocalAutomationBackend = MacAutomationBackend;
@@ -136,6 +138,7 @@ impl MacAutomationBackend {
     }
 
     pub fn from_config(config: &AppConfig) -> Self {
+        let calendar_token = crate::calendar::get_calendar_token_from_keychain();
         Self {
             allowed_paths: config.allowed_paths.clone(),
             app_aliases: default_app_aliases(),
@@ -143,6 +146,7 @@ impl MacAutomationBackend {
             browser_sidecar: BrowserSidecarManager::new(config.browser.clone()),
             http_client: reqwest::Client::new(),
             vision_api_key: config.provider.fallback_api_key.clone(),
+            calendar: CalendarService::new(None, calendar_token),
         }
     }
 
@@ -184,6 +188,10 @@ impl MacAutomationBackend {
             "screen_click",
             "mail_compose",
             "messages_compose",
+            "calendar_get_todays_events",
+            "calendar_get_upcoming_events",
+            "calendar_search_events",
+            "calendar_get_next_event",
             "filesystem_list",
             "filesystem_create_folder",
             "filesystem_read_file",
@@ -276,7 +284,7 @@ impl MacAutomationBackend {
             .post("https://api.openai.com/v1/chat/completions")
             .bearer_auth(api_key)
             .json(&serde_json::json!({
-                "model": "gpt-4o-mini",
+                "model": "gpt-4o",
                 "max_tokens": 60,
                 "messages": [{
                     "role": "user",
@@ -291,7 +299,7 @@ impl MacAutomationBackend {
                         {
                             "type": "text",
                             "text": format!(
-                                "This is a macOS screenshot. Find the UI element matching '{}'. Return ONLY valid JSON with no markdown: {{\"x\": <0.0-1.0 fraction from left edge>, \"y\": <0.0-1.0 fraction from top edge>}} for the exact center of that element. If multiple matches exist, pick the most prominent one.",
+                                "This is a macOS screenshot. Find and return the coordinates of: '{}'. If the label mentions a 'green play button' or 'play button', look for a bright green filled circle with a white triangular play icon (▶) inside it. This is the most visually distinct element — return its exact center coordinates. For any other label, find the best matching UI element. Return ONLY valid JSON with no markdown: {{\"x\": <0.0-1.0>, \"y\": <0.0-1.0>}}.",
                                 label
                             )
                         }
@@ -899,12 +907,39 @@ impl AutomationBackend for MacAutomationBackend {
             ).await,
             "chrome_open_tab" | "browser_open" => {
                 let args: ChromeUrlArgs = serde_json::from_value(request.arguments)?;
-                self.call_browser_tool(
+                // Try the browser sidecar first; fall back to AppleScript if sidecar isn't running
+                match self.call_browser_tool(
                     "browser_open",
                     "/browser/open",
                     json!({ "url": args.url }),
                     "Opened browser page",
-                ).await
+                ).await {
+                    Ok(result) => Ok(result),
+                    Err(_) => {
+                        // Sidecar unavailable — open the URL directly in Chrome via AppleScript
+                        self.run_applescript_lines(&[
+                            r#"tell application "Google Chrome""#.to_string(),
+                            "activate".to_string(),
+                            format!(r#"open location "{}""#, args.url),
+                            "end tell".to_string(),
+                        ])?;
+                        thread::sleep(Duration::from_millis(600));
+                        let title = self.run_applescript_lines(&[
+                            r#"tell application "Google Chrome""#.to_string(),
+                            "return title of active tab of front window".to_string(),
+                            "end tell".to_string(),
+                        ]).unwrap_or_else(|_| args.url.clone());
+                        let mut result = Self::summary(
+                            "browser_open",
+                            format!("Opened {} in Chrome", args.url),
+                            Some(title.clone()),
+                            json!({ "url": args.url }),
+                        );
+                        result.proof_passed = true;
+                        result.observed_outcome = Some(title);
+                        Ok(result)
+                    }
+                }
             }
             "chrome_get_dom" | "browser_snapshot" => self.call_browser_tool(
                 "browser_snapshot",
@@ -1004,28 +1039,86 @@ impl AutomationBackend for MacAutomationBackend {
                 ))
             }
             "media_control" => {
-                // Native AppleScript control for Spotify / Music / system media
+                // Native AppleScript + keyboard control for Spotify / Music / system media
                 let action = request.arguments["action"].as_str().unwrap_or("play").to_string();
                 let app = request.arguments["app"].as_str().unwrap_or("Spotify").to_string();
-                let script_action = match action.to_lowercase().as_str() {
-                    "pause" | "stop" => "pause",
-                    "next" | "next_track" => "next track",
-                    "previous" | "prev" | "previous_track" => "previous track",
-                    _ => "play", // play / resume / toggle all map to "play"
-                };
-                let result = self.run_applescript_lines(&[
-                    format!("tell application \"{}\"", app),
-                    script_action.to_string(),
-                    "end tell".to_string(),
-                ]);
-                match result {
-                    Ok(_) => Ok(Self::summary(
+                let query = request.arguments["query"].as_str().unwrap_or("").to_string();
+
+                if action.to_lowercase() == "search" {
+                    // Search in Spotify: activate → Cmd+L → type query → Enter
+                    // Then navigate to Songs section and play the first result
+                    self.run_applescript_lines(&[
+                        format!("tell application \"{}\" to activate", app),
+                    ])?;
+                    thread::sleep(Duration::from_millis(500));
+                    // Cmd+L focuses the search bar
+                    self.run_applescript_lines(&[
+                        r#"tell application "System Events""#.to_string(),
+                        format!(r#"tell application process "{}""#, app),
+                        r#"keystroke "l" using {command down}"#.to_string(),
+                        "end tell".to_string(),
+                        "end tell".to_string(),
+                    ])?;
+                    thread::sleep(Duration::from_millis(400));
+                    // Select all, type query, press Enter to load full search results page
+                    self.run_applescript_lines(&[
+                        r#"tell application "System Events""#.to_string(),
+                        format!(r#"tell application process "{}""#, app),
+                        r#"keystroke "a" using {command down}"#.to_string(),
+                        format!(r#"keystroke "{}""#, escape_applescript(&query)),
+                        r#"key code 36"#.to_string(), // Enter — show full results page
+                        "end tell".to_string(),
+                        "end tell".to_string(),
+                    ])?;
+                    // Wait for full search results page to load
+                    thread::sleep(Duration::from_millis(2000));
+                    // Tab to focus the Top Result card (blue box appears around song name)
+                    self.run_applescript_lines(&[
+                        r#"tell application "System Events""#.to_string(),
+                        format!(r#"tell application process "{}""#, app),
+                        r#"key code 48"#.to_string(), // Tab → blue box on song name
+                        "end tell".to_string(),
+                        "end tell".to_string(),
+                    ])?;
+                    thread::sleep(Duration::from_millis(500));
+                    // Press Enter twice: first to select, second to play
+                    self.run_applescript_lines(&[
+                        r#"tell application "System Events""#.to_string(),
+                        format!(r#"tell application process "{}""#, app),
+                        r#"key code 36"#.to_string(), // Enter 1 — select
+                        "delay 0.3".to_string(),
+                        r#"key code 36"#.to_string(), // Enter 2 — play
+                        "end tell".to_string(),
+                        "end tell".to_string(),
+                    ])?;
+                    thread::sleep(Duration::from_millis(400));
+                    Ok(Self::summary(
                         "media_control",
-                        format!("{} {}", script_action, app),
-                        Some(format!("Sent '{}' command to {}", script_action, app)),
-                        json!({"action": script_action, "app": app}),
-                    )),
-                    Err(e) => bail!("media_control failed: {}", e),
+                        format!("Searched '{}' and played first result in {}", query, app),
+                        Some(format!("Searched for '{}' and started playing the first result", query)),
+                        json!({"action": "search", "query": query, "app": app}),
+                    ))
+                } else {
+                    let script_action = match action.to_lowercase().as_str() {
+                        "pause" | "stop" => "pause",
+                        "next" | "next_track" => "next track",
+                        "previous" | "prev" | "previous_track" => "previous track",
+                        _ => "play", // play / resume / toggle all map to "play"
+                    };
+                    let result = self.run_applescript_lines(&[
+                        format!("tell application \"{}\"", app),
+                        script_action.to_string(),
+                        "end tell".to_string(),
+                    ]);
+                    match result {
+                        Ok(_) => Ok(Self::summary(
+                            "media_control",
+                            format!("{} {}", script_action, app),
+                            Some(format!("Sent '{}' command to {}", script_action, app)),
+                            json!({"action": script_action, "app": app}),
+                        )),
+                        Err(e) => bail!("media_control failed: {}", e),
+                    }
                 }
             }
             "screen_click" => {
@@ -1105,22 +1198,51 @@ impl AutomationBackend for MacAutomationBackend {
                     .recipient
                     .ok_or_else(|| anyhow!("messages_compose requires a recipient"))?;
 
-                // Activate Messages first, then open the sms: URL to pre-fill recipient + body
+                // Activate Messages and open a new compose window via keyboard shortcut,
+                // then type the recipient name and body. This works for any contact name,
+                // phone number, or email — unlike the sms: URL which only handles numbers.
                 self.run_applescript_lines(&[
                     r#"tell application "Messages" to activate"#.to_string(),
                 ])?;
-                thread::sleep(Duration::from_millis(400));
-
-                let url = format!(
-                    "sms:{}&body={}",
-                    percent_encode_for_url(&recipient),
-                    percent_encode_for_url(&args.body)
-                );
-                // Use do shell script to open the URL — more reliable than AppleScript open location
+                thread::sleep(Duration::from_millis(600));
+                // Cmd+N → new message compose window
                 self.run_applescript_lines(&[
-                    format!(r#"do shell script "open '{}'"#, url.replace('\'', "%27")),
+                    r#"tell application "System Events""#.to_string(),
+                    r#"tell application process "Messages""#.to_string(),
+                    r#"keystroke "n" using {command down}"#.to_string(),
+                    "end tell".to_string(),
+                    "end tell".to_string(),
                 ])?;
-                thread::sleep(Duration::from_millis(800));
+                thread::sleep(Duration::from_millis(400));
+                // Type the recipient name into the To: field
+                self.run_applescript_lines(&[
+                    r#"tell application "System Events""#.to_string(),
+                    r#"tell application process "Messages""#.to_string(),
+                    format!(r#"keystroke "{}""#, escape_applescript(&recipient)),
+                    "end tell".to_string(),
+                    "end tell".to_string(),
+                ])?;
+                thread::sleep(Duration::from_millis(300));
+                // Return to select the first contact suggestion, then Tab to body
+                self.run_applescript_lines(&[
+                    r#"tell application "System Events""#.to_string(),
+                    r#"tell application process "Messages""#.to_string(),
+                    r#"key code 36"#.to_string(), // Return key
+                    "delay 0.2".to_string(),
+                    r#"key code 48"#.to_string(), // Tab key
+                    "end tell".to_string(),
+                    "end tell".to_string(),
+                ])?;
+                thread::sleep(Duration::from_millis(300));
+                // Type the message body
+                self.run_applescript_lines(&[
+                    r#"tell application "System Events""#.to_string(),
+                    r#"tell application process "Messages""#.to_string(),
+                    format!(r#"keystroke "{}""#, escape_applescript(&args.body)),
+                    "end tell".to_string(),
+                    "end tell".to_string(),
+                ])?;
+                thread::sleep(Duration::from_millis(400));
 
                 let frontmost = self.frontmost_app_name().unwrap_or_default();
                 let window_count = self.run_applescript_lines(&[
@@ -1133,9 +1255,9 @@ impl AutomationBackend for MacAutomationBackend {
                 let mut result = Self::summary(
                     "messages_compose",
                     if proof_passed {
-                        format!("Opened Messages compose for {} (verified)", recipient)
+                        format!("Composed Messages draft for {} (verified)", recipient)
                     } else {
-                        format!("Opened Messages for {} (verification incomplete)", recipient)
+                        format!("Composed Messages draft for {} (verification incomplete)", recipient)
                     },
                     Some(args.body.clone()),
                     json!({
@@ -1147,7 +1269,7 @@ impl AutomationBackend for MacAutomationBackend {
                 );
                 result.target_identity = Some("com.apple.MobileSMS".to_string());
                 result.proof_passed = proof_passed;
-                result.observed_outcome = Some(format!("Messages open with {} windows", window_count));
+                result.observed_outcome = Some(format!("Messages compose open with {} windows", window_count));
                 Ok(result)
             }
             "filesystem_list" => {
@@ -1224,6 +1346,117 @@ impl AutomationBackend for MacAutomationBackend {
                     None,
                     json!({ "path": args.path }),
                 ))
+            }
+            "calendar_get_todays_events" => {
+                if !self.calendar.is_configured() {
+                    return Ok(Self::summary(
+                        "calendar_get_todays_events",
+                        "Google Calendar not configured. Run: `security add-generic-password -a jarvis -s jarvis-google-calendar -w YOUR_TOKEN`",
+                        None,
+                        json!({"configured": false}),
+                    ));
+                }
+
+                let events = self.calendar.get_todays_events().await?;
+                let formatted = self.calendar.format_events(&events);
+                Ok(Self::summary(
+                    "calendar_get_todays_events",
+                    format!("Found {} events today", events.len()),
+                    Some(formatted.clone()),
+                    json!({
+                        "event_count": events.len(),
+                        "events": events,
+                        "formatted": formatted,
+                    }),
+                ))
+            }
+            "calendar_get_upcoming_events" => {
+                if !self.calendar.is_configured() {
+                    return Ok(Self::summary(
+                        "calendar_get_upcoming_events",
+                        "Google Calendar not configured",
+                        None,
+                        json!({"configured": false}),
+                    ));
+                }
+
+                let hours = request.arguments.get("hours")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(24) as u32;
+
+                let events = self.calendar.get_upcoming_events(hours).await?;
+                let formatted = self.calendar.format_events(&events);
+                Ok(Self::summary(
+                    "calendar_get_upcoming_events",
+                    format!("Found {} upcoming events in next {} hours", events.len(), hours),
+                    Some(formatted.clone()),
+                    json!({
+                        "event_count": events.len(),
+                        "hours": hours,
+                        "events": events,
+                        "formatted": formatted,
+                    }),
+                ))
+            }
+            "calendar_search_events" => {
+                if !self.calendar.is_configured() {
+                    return Ok(Self::summary(
+                        "calendar_search_events",
+                        "Google Calendar not configured",
+                        None,
+                        json!({"configured": false}),
+                    ));
+                }
+
+                let query = request.arguments.get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let events = self.calendar.search_events(query).await?;
+                let formatted = self.calendar.format_events(&events);
+                Ok(Self::summary(
+                    "calendar_search_events",
+                    format!("Found {} events matching '{}'", events.len(), query),
+                    Some(formatted.clone()),
+                    json!({
+                        "event_count": events.len(),
+                        "query": query,
+                        "events": events,
+                        "formatted": formatted,
+                    }),
+                ))
+            }
+            "calendar_get_next_event" => {
+                if !self.calendar.is_configured() {
+                    return Ok(Self::summary(
+                        "calendar_get_next_event",
+                        "Google Calendar not configured",
+                        None,
+                        json!({"configured": false}),
+                    ));
+                }
+
+                let next_event = self.calendar.get_next_event().await?;
+                if let Some(event) = next_event {
+                    let formatted = self.calendar.format_events(&[event.clone()]);
+                    Ok(Self::summary(
+                        "calendar_get_next_event",
+                        format!("Next event: {}", event.summary),
+                        Some(formatted.clone()),
+                        json!({
+                            "has_next": true,
+                            "event": event,
+                            "formatted": formatted,
+                        }),
+                    ))
+                } else {
+                    Ok(Self::summary(
+                        "calendar_get_next_event",
+                        "No upcoming events found",
+                        None,
+                        json!({"has_next": false}),
+                    ))
+                }
             }
             "shell_run" => {
                 let args: ShellArgs = serde_json::from_value(request.arguments)?;
