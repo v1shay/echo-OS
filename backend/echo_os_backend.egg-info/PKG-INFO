@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: echo-os-backend
+Version: 0.1.0
+Summary: Production-grade agentic backend for Echo OS.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: vosk>=0.3.44
+Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: langgraph>=0.2.34
+Requires-Dist: openai>=1.50.0
+Requires-Dist: chromadb>=0.5.5
+Requires-Dist: certifi>=2024.8.30
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: websockets>=13.1
+Requires-Dist: tenacity>=9.0.0
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: orjson>=3.10.7
+Requires-Dist: structlog>=24.4.0
+Requires-Dist: playwright>=1.48.0
+Requires-Dist: twilio>=9.3.0
+Requires-Dist: google-api-python-client>=2.147.0
+Requires-Dist: google-auth>=2.35.0
+Requires-Dist: google-auth-oauthlib>=1.2.1
+Requires-Dist: pyperclip>=1.9.0
+Requires-Dist: pyautogui>=0.9.54
+Requires-Dist: mss>=9.0.2
+Requires-Dist: openwakeword>=0.6.0
+Requires-Dist: numpy>=2.1.1
+Provides-Extra: dev
+Requires-Dist: ruff>=0.6.7; extra == "dev"
+Requires-Dist: pytest>=8.3.3; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+
+# Echo OS Backend
+
+FastAPI and LangGraph backend for the Echo OS agent runtime.

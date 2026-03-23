@@ -1,0 +1,53 @@
+[project]
+name = "echo-os-backend"
+version = "0.1.0"
+description = "Production-grade agentic backend for Echo OS."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "vosk>=0.3.44",
+  "pydantic-settings>=2.4.0",
+  "langgraph>=0.2.34",
+  "openai>=1.50.0",
+  "chromadb>=0.5.5",
+  "certifi>=2024.8.30",
+  "httpx>=0.27.0",
+  "websockets>=13.1",
+  "tenacity>=9.0.0",
+  "python-dotenv>=1.0.1",
+  "orjson>=3.10.7",
+  "structlog>=24.4.0",
+  "playwright>=1.48.0",
+  "twilio>=9.3.0",
+  "google-api-python-client>=2.147.0",
+  "google-auth>=2.35.0",
+  "google-auth-oauthlib>=1.2.1",
+  "pyperclip>=1.9.0",
+  "pyautogui>=0.9.54",
+  "mss>=9.0.2",
+  "openwakeword>=0.6.0",
+  "numpy>=2.1.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.7",
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0"
+]
+
+[build-system]
+requires = ["setuptools>=75.1.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,15 @@
+{
+  "name": "echo-os-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsc -p tsconfig.json && electron .",
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "electron": "^32.1.2",
+    "typescript": "^5.6.2"
+  }
+}
