@@ -1,0 +1,13 @@
+---
+description: Always state model / agent identity at the start of replies
+alwaysApply: true
+---
+
+# Model disclosure
+
+At the **start of every substantive Agent reply** (more than a trivial acknowledgment), add **one short line** identifying what is answering this turn:
+
+- If your system context or metadata includes an explicit **model name** (or equivalent, e.g. codename/version), state that verbatim.
+- If no user-selected model name is available to you, state that clearly — e.g. that the exact model is chosen in Cursor and is **not visible in your context** — then state only what *is* provided (such as the agent/router identity). **Do not invent or assume a model name.**
+
+Keep this line to a single sentence so it does not dominate the answer.

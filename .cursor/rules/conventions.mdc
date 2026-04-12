@@ -1,0 +1,12 @@
+---
+description: Project conventions — stack, structure, constraints (CONVENTIONS.md)
+alwaysApply: true
+---
+
+# Project conventions
+
+Before substantial changes, follow the canonical conventions below (full source attached via `@CONVENTIONS.md`).
+
+It defines product scope, stack, constraints (camera/HTTPS, API keys, MediaPipe sampling, hackathon pace), the required `src/` and `api/` layout, and per-person file ownership. Match naming and structure to that doc; do not cross into areas owned by another person without explicit agreement.
+
+@CONVENTIONS.md
