@@ -83,7 +83,6 @@ cd echo-os
 
 ## Setup & Run
 
-```bash
 # clone
 git clone https://github.com/your-username/echo-os.git
 cd echo-os
