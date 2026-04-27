@@ -12,33 +12,45 @@ echo-OS is a voice-native system that executes real-world tasks through continuo
 
 ## Overview
 
-Modern computing is built around keyboards, mice, and visual interfaces. This model is inefficient and exclusionary.
-
 echo-OS replaces manual interaction with a voice-driven execution layer.
 
 Users state intent in natural language.  
 The system interprets, plans, executes, verifies, and responds continuously.
 
-This is not a chatbot.  
-This is a persistent execution system.
+
+---
+
+## Tech Stack
+
+| Layer         | Technology          |
+|--------------|-------------------|
+| Frontend     | React + Tailwind  |
+| Realtime     | WebSockets        |
+| Backend      | Python            |
+| Agent Model  | LLM APIs          |
+| STT          | Whisper / APIs    |
+| TTS          | ElevenLabs / APIs |
+| Desktop      | Electron          |
+| Orchestration| Custom Agent Loop |
 
 ---
 
 ## Core Flow
 
-* Microphone Input
-↓
-* Speech-to-Text (STT)
-↓
-* Agent Reasoning Engine
-↓
-* Execution Layer (Local + Web Tools)
-↓
-* Verification Layer
-↓
-* Memory System
-↓
-* Text-to-Speech (TTS)
+* ↓ Microphone Input
+
+* ↓ Speech-to-Text (STT)
+
+* ↓ Agent Reasoning Engine
+
+* ↓ Execution Layer (Local + Web Tools)
+
+* ↓ Verification Layer
+  
+* ↓ Memory System
+  
+* ↓ Text-to-Speech (TTS)
+
 ---
 
 ## Architecture
@@ -59,52 +71,15 @@ This is a persistent execution system.
 
 ---
 
-## Agent Loop
-
-1. Interpret intent  
-2. Decompose into steps  
-3. Execute via tools  
-4. Verify outputs  
-5. Retry or repair failures  
-6. Persist context  
-7. Respond via voice  
-
-Enables task completion—not just output generation.
-
----
-
-## Tech Stack
-
-| Layer         | Technology          |
-|--------------|-------------------|
-| Frontend     | React + Tailwind  |
-| Realtime     | WebSockets        |
-| Backend      | Python            |
-| Agent Model  | LLM APIs          |
-| STT          | Whisper / APIs    |
-| TTS          | ElevenLabs / APIs |
-| Desktop      | Electron          |
-| Orchestration| Custom Agent Loop |
-
----
-
-## Key Features
-
-- Voice-first interaction  
-- Autonomous task execution  
-- Persistent memory  
-- Tool-based reasoning  
-- Verification and self-repair  
-- Ambient system UX  
-
----
-
 ## Installation
 
 ### Clone
+
 ```bash
-git clone https://github.com/your-username/echo-os.git
+git clone https://github.com/v1shay/echo-os.git
 cd echo-os
+
+---
 
 ## Setup & Run
 
