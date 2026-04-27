@@ -1,167 +1,149 @@
-# echo-OS  
-**A Voice-First Autonomous Operating System**
+<p align="center">
+  <img width="700" alt="echo-OS Demo" src="https://github.com/user-attachments/assets/4e9659b0-cb91-451d-9181-0962e7dbf343" />
+</p>
+
+<p align="center"><strong>A Voice-First Autonomous Operating System</strong></p>
+
+<p align="center">
+echo-OS is a voice-native system that executes real-world tasks through continuous autonomous agents.
+</p>
 
 ---
 
-## Vision & Problem Statement
+## Overview
 
-Modern computing is fundamentally visual and manual—designed around keyboards, mice, and screens. This paradigm excludes millions of users and slows down everyone else.
+Modern computing is built around keyboards, mice, and visual interfaces. This model is inefficient and exclusionary.
 
-echo-OS rethinks the interface entirely.
+echo-OS replaces manual interaction with a voice-driven execution layer.
 
-We are building a **voice-native operating system layer** where users interact through natural language, and an autonomous agent executes tasks across their machine and the web.
-
-Instead of clicking through interfaces, users simply *say what they want*.  
-The system interprets intent, plans actions, executes them, verifies results, and responds continuously.
+Users state intent in natural language.  
+The system interprets, plans, executes, verifies, and responds continuously.
 
 This is not a chatbot.  
-This is a **persistent, agentic system for real-world task execution**.
+This is a persistent execution system.
 
 ---
 
-## System Architecture
+## Core Flow
 
-echo-OS is built as a **continuous agent loop** integrating voice, reasoning, execution, and feedback.
+* Microphone Input
+↓
+* Speech-to-Text (STT)
+↓
+* Agent Reasoning Engine
+↓
+* Execution Layer (Local + Web Tools)
+↓
+* Verification Layer
+↓
+* Memory System
+↓
+* Text-to-Speech (TTS)
+---
 
-### Core Flow
-
-```text
-Microphone Input
-   ↓
-Speech-to-Text (STT)
-   ↓
-Agent Reasoning Engine
-   ↓
-Execution Layer (Local + Web Tools)
-   ↓
-Verification Layer
-   ↓
-Memory System
-   ↓
-Text-to-Speech (TTS) Response
-   ↓
-User
-
-## Component Breakdown
+## Architecture
 
 ### Frontend (React + WebSockets)
-- Real-time interface displaying:
-  - Transcripts
-  - Agent reasoning steps
-  - Execution state
-- Subscribes to backend events via WebSockets  
-- Designed to be ambient, not intrusive  
-
----
+- Real-time interface for transcripts, reasoning, and execution state  
+- Streams updates via WebSockets  
+- Designed to remain ambient and low-friction  
 
 ### Backend (Python Agent Engine)
-- Core intelligence layer  
-- Handles:
-  - Intent parsing
-  - Task planning
-  - Tool selection
-  - Execution orchestration  
+- Handles intent parsing, planning, tool selection, and orchestration  
 - Maintains persistent session memory  
-- Runs a **looped agent system**, not one-shot requests  
-
----
+- Runs a continuous agent loop (not request-response)
 
 ### Desktop Layer (Electron)
-- Bridges web UI with native OS control  
-- Enables:
-  - File system access
-  - App control
-  - System-level automation  
-- Converts echo-OS from a web app into a true operating layer  
+- Enables native system control (files, apps, OS automation)  
+- Converts system into a true operating layer  
 
 ---
 
-## Agent Loop (Key Innovation)
+## Agent Loop
 
-echo-OS operates as a **closed-loop autonomous system**:
-
-1. Understand user intent  
-2. Break into actionable steps  
+1. Interpret intent  
+2. Decompose into steps  
 3. Execute via tools  
-4. Verify correctness  
-5. Retry or repair if needed  
-6. Store context in memory  
-7. Respond conversationally  
+4. Verify outputs  
+5. Retry or repair failures  
+6. Persist context  
+7. Respond via voice  
 
-This loop enables **real task completion**, not just responses.
+Enables task completion—not just output generation.
 
 ---
 
 ## Tech Stack
 
-| Layer         | Technology         | Why? |
-|--------------|------------------|------|
-| Frontend      | React + Tailwind | Fast UI iteration and responsive design |
-| Realtime      | WebSockets       | Low-latency state streaming |
-| Backend       | Python           | Strong ecosystem for AI and agent systems |
-| Agent Model   | LLM APIs         | Natural language reasoning and planning |
-| STT           | Whisper / APIs   | High-accuracy speech recognition |
-| TTS           | ElevenLabs / APIs| Natural conversational output |
-| Desktop       | Electron         | Native OS control and packaging |
-| Orchestration | Custom Agent Loop| Enables autonomy and execution |
+| Layer         | Technology          |
+|--------------|-------------------|
+| Frontend     | React + Tailwind  |
+| Realtime     | WebSockets        |
+| Backend      | Python            |
+| Agent Model  | LLM APIs          |
+| STT          | Whisper / APIs    |
+| TTS          | ElevenLabs / APIs |
+| Desktop      | Electron          |
+| Orchestration| Custom Agent Loop |
 
 ---
 
 ## Key Features
 
-- **Voice-First Interaction**  
-  Fully replaces traditional UI input with natural speech  
-
-- **Autonomous Task Execution**  
-  Completes real tasks like sending emails, organizing files, browsing, and more  
-
-- **Persistent Memory**  
-  Remembers past interactions for context-aware responses  
-
-- **Tool-Oriented Reasoning**  
-  Dynamically selects tools instead of relying on hardcoded workflows  
-
-- **Verification & Self-Repair**  
-  Checks outputs and retries failed tasks  
-
-- **Ambient Interface**  
-  Feels like a system presence, not a chatbot  
+- Voice-first interaction  
+- Autonomous task execution  
+- Persistent memory  
+- Tool-based reasoning  
+- Verification and self-repair  
+- Ambient system UX  
 
 ---
 
-## Installation & Setup
+## Installation
 
-### 1. Clone the Repository
+### Clone
 ```bash
 git clone https://github.com/your-username/echo-os.git
 cd echo-os
 
-### 2. Setup Backend
+## Setup & Run
+
+```bash
+# clone
+git clone https://github.com/your-username/echo-os.git
+cd echo-os
+
+# backend setup
 cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cd ..
 
-### 3. Setup Frontend
-cd ../frontend
+# frontend setup
+cd frontend
 npm install
+cd ..
 
-### 4. Desktop App
-cd ../desktop
+# desktop setup
+cd desktop
 npm install
+cd ..
 
-### ENVIRONMENT VARIABLES
-OPENAI_API_KEY=your_key_here
-ELEVENLABS_API_KEY=your_key_here
+# environment variables
+export OPENAI_API_KEY=your_key_here
+export ELEVENLABS_API_KEY=your_key_here
 
-### start frontend
+# run system (3 terminals)
+
+# terminal 1 - backend
 cd backend
 uvicorn main:app --reload
 
-### start backend
+# terminal 2 - frontend
 cd frontend
 npm run dev
 
-### start desktop app
+# terminal 3 - desktop
 cd desktop
 npm run electron
