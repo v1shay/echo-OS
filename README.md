@@ -1,123 +1,83 @@
-<p align="center">
-  <img width="700" alt="echo-OS Demo" src="https://github.com/user-attachments/assets/4e9659b0-cb91-451d-9181-0962e7dbf343" />
-</p>
+<div align="center">
 
-<p align="center"><strong>A Voice-First Autonomous Operating System</strong></p>
-
-<p align="center">
-echo-OS is a voice-native system that executes real-world tasks through continuous autonomous agents.
-</p>
-
----
-
-## Overview
-
-echo-OS replaces manual interaction with a voice-driven execution layer.
-
-Users state intent in natural language.  
-The system interprets, plans, executes, verifies, and responds continuously.
+<img width="700" alt="echo-OS Demo" src="https://github.com/user-attachments/assets/4e9659b0-cb91-451d-9181-0962e7dbf343" />
 
 
 ---
 
-## Tech Stack
+**Echo-OS is a voice-first autonomous OS** that executes real-world tasks through continuous autonomous agents.
 
-| Layer         | Technology          |
-|--------------|-------------------|
-| Frontend     | React + Tailwind  |
-| Realtime     | WebSockets        |
-| Backend      | Python            |
-| Agent Model  | LLM APIs          |
-| STT          | Whisper / APIs    |
-| TTS          | ElevenLabs / APIs |
-| Desktop      | Electron          |
-| Orchestration| Custom Agent Loop |
+A real-time execution layer that runs on natural language input, built as the **winner of an ElevenLabs, FeatherlessAI, and AoPS-backed hackathon**.
+
+</div>
 
 ---
 
-## Core Flow
+## Features
 
-* ↓ Microphone Input
-
-* ↓ Speech-to-Text (STT)
-
-* ↓ Agent Reasoning Engine
-
-* ↓ Execution Layer (Local + Web Tools)
-
-* ↓ Verification Layer
-  
-* ↓ Memory System
-  
-* ↓ Text-to-Speech (TTS)
+- Voice → execution pipeline (not just transcription)
+- Continuous agent loop (not request/response)
+- Real-time reasoning + execution streaming
+- Native OS control via Electron layer
+- Tool use across local system and web
+- Persistent memory across sessions
+- End-to-end speech interface (STT + TTS)
 
 ---
 
 ## Architecture
 
-### Frontend (React + WebSockets)
-- Real-time interface for transcripts, reasoning, and execution state  
-- Streams updates via WebSockets  
-- Designed to remain ambient and low-friction  
-
-### Backend (Python Agent Engine)
-- Handles intent parsing, planning, tool selection, and orchestration  
-- Maintains persistent session memory  
-- Runs a continuous agent loop (not request-response)
-
-### Desktop Layer (Electron)
-- Enables native system control (files, apps, OS automation)  
-- Converts system into a true operating layer  
+| Layer | Purpose | Stack |
+|---|---|---|
+| Interface | Real-time transcripts + execution state | React + WebSockets |
+| Agent | Planning, reasoning, orchestration | Python |
+| Execution | Local + web task execution | Custom tool layer |
+| Voice | Input + output speech pipeline | Whisper + ElevenLabs |
+| Desktop | System-level control | Electron |
 
 ---
 
-## Installation
+## Anatomy
 
-### Clone
+```txt
+echo-os/
+├── frontend/        # realtime UI + streaming state
+├── backend/         # agent loop + orchestration
+├── desktop/         # electron system layer
+├── agents/          # planning + execution logic
+├── tools/           # local + web integrations
+└── memory/          # session + persistent state
+```
+
+## Install
 
 ```bash
-git clone https://github.com/v1shay/echo-os.git
-cd echo-os
-
----
-
-## Setup & Run
-
-# clone
 git clone https://github.com/your-username/echo-os.git
 cd echo-os
+```
 
-# backend setup
+## Backend
+
+```bash
 cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cd ..
-
-# frontend setup
-cd frontend
-npm install
-cd ..
-
-# desktop setup
-cd desktop
-npm install
-cd ..
-
-# environment variables
-export OPENAI_API_KEY=your_key_here
-export ELEVENLABS_API_KEY=your_key_here
-
-# run system (3 terminals)
-
-# terminal 1 - backend
-cd backend
 uvicorn main:app --reload
 
-# terminal 2 - frontend
-cd frontend
-npm run dev
+```
+## Frontend
 
-# terminal 3 - desktop
-cd desktop
+```bash
+cd ../frontend
+npm install
+npm run dev
+```
+
+## Desktop
+
+```bash
+cd ../desktop
+npm install
 npm run electron
+```
