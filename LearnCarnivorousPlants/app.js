@@ -204,9 +204,11 @@
     skeleton.className = 'img-skeleton';
     wrap.appendChild(skeleton);
 
+    const isExternal = filename.startsWith('http');
+
     const img = document.createElement('img');
     img.className = 'gallery-img loading';
-    img.alt = filename.replace(/_/g, ' ').replace(/\.[^.]+$/, '');
+    img.alt = isExternal ? 'Cultivar photo' : filename.replace(/_/g, ' ').replace(/\.[^.]+$/, '');
     img.onload  = () => { img.classList.replace('loading', 'loaded'); skeleton.classList.add('hidden'); };
     img.onerror = () => {
       skeleton.classList.add('hidden');
@@ -219,32 +221,36 @@
         <span>Image unavailable</span>
       </div>`;
     };
-    img.src = BASE + filename + '&width=600';
+    img.src = isExternal ? filename : (BASE + filename + '&width=600');
     wrap.appendChild(img);
     item.appendChild(wrap);
 
     const citeEl = document.createElement('p');
     citeEl.className = 'img-citation';
-    citeEl.innerHTML = '<span class="cite-loading">Loading attribution\u2026</span>';
     item.appendChild(citeEl);
 
-    const pageUrl = 'https://commons.wikimedia.org/wiki/File:' + decodeURIComponent(filename);
-
-    fetchCitation(filename).then(info => {
-      if (!info) {
-        citeEl.innerHTML = `<a href="${pageUrl}" target="_blank" rel="noopener">Wikimedia Commons</a>`;
-        return;
-      }
-      const licPart = info.license
-        ? (info.licUrl
-            ? `<a href="${info.licUrl}" target="_blank" rel="noopener">${info.license}</a>`
-            : info.license)
-        : '';
-      citeEl.innerHTML =
-        `<strong>${info.author}</strong>` +
-        (licPart ? ` &middot; ${licPart}` : '') +
-        ` &middot; <a href="${pageUrl}" target="_blank" rel="noopener">Wikimedia Commons</a>`;
-    });
+    if (isExternal) {
+      const host = new URL(filename).hostname.replace('www.', '');
+      citeEl.innerHTML = `<a href="${filename}" target="_blank" rel="noopener">${host}</a>`;
+    } else {
+      citeEl.innerHTML = '<span class="cite-loading">Loading attribution\u2026</span>';
+      const pageUrl = 'https://commons.wikimedia.org/wiki/File:' + decodeURIComponent(filename);
+      fetchCitation(filename).then(info => {
+        if (!info) {
+          citeEl.innerHTML = `<a href="${pageUrl}" target="_blank" rel="noopener">Wikimedia Commons</a>`;
+          return;
+        }
+        const licPart = info.license
+          ? (info.licUrl
+              ? `<a href="${info.licUrl}" target="_blank" rel="noopener">${info.license}</a>`
+              : info.license)
+          : '';
+        citeEl.innerHTML =
+          `<strong>${info.author}</strong>` +
+          (licPart ? ` &middot; ${licPart}` : '') +
+          ` &middot; <a href="${pageUrl}" target="_blank" rel="noopener">Wikimedia Commons</a>`;
+      });
+    }
 
     return item;
   }
