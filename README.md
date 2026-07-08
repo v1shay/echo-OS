@@ -52,7 +52,7 @@ echo-os/
 ## Install
 
 ```bash
-git clone https://github.com/your-username/echo-os.git
+git clone https://github.com/v1shay/echo-os.git
 cd echo-os
 ```
 
